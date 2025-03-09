@@ -11,13 +11,22 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/jolynch/vwatch/internal/api"
+	"github.com/jolynch/vwatch/internal/repl"
+	"github.com/jolynch/vwatch/internal/util"
 )
 
 var (
-	listen    = "127.0.0.1:8080"
-	blockFor  = 10 * time.Second
-	jitterFor = 1 * time.Second
-	logLevel  = new(slog.LevelVar)
+	listen        = "127.0.0.1:8080"
+	replicateWith = ""
+	fillAddr      = ""
+	fillPath      = "/version/${name}"
+	blockFor      = 10 * time.Second
+	jitterFor     = 1 * time.Second
+	logLevel      = new(slog.LevelVar)
+
+	filler    *repl.Filler = nil
 	versions  sync.Map
 	watchers  map[string]Watcher = make(map[string]Watcher)
 	watchLock sync.Mutex
@@ -36,13 +45,7 @@ func makeWatcher() Watcher {
 	return Watcher{WatchGroup: &wg, Signal: ch}
 }
 
-type Version struct {
-	Name     string     `json:"name"`
-	Version  string     `json:"version"`
-	LastSync *time.Time `json:"last-sync"`
-}
-
-func storeNewVersion(name string, version Version) {
+func storeNewVersion(name string, version api.Version) {
 	versions.Store(name, version)
 
 	watchLock.Lock()
@@ -62,7 +65,7 @@ func version(w http.ResponseWriter, req *http.Request) {
 	var (
 		timeout time.Duration = blockFor
 		err     error
-		version Version
+		version api.Version
 		name    string = req.PathValue("name")
 	)
 
@@ -77,8 +80,8 @@ func version(w http.ResponseWriter, req *http.Request) {
 		}
 		pv, ok := versions.Load(name)
 		if ok {
-			prev := pv.(Version).LastSync.UnixNano()
-			if prev < version.LastSync.UnixNano() && pv.(Version).Version != version.Version {
+			prev := pv.(api.Version).LastSync.UnixNano()
+			if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
 				go storeNewVersion(name, version)
 			}
 		} else {
@@ -95,10 +98,22 @@ func version(w http.ResponseWriter, req *http.Request) {
 		}
 		val, ok := versions.Load(name)
 		if !ok {
-			http.Error(w, fmt.Sprintf("{\"error\": \"%s not found\"}", name), http.StatusNotFound)
-			return
+			if filler != nil {
+				params := util.ParseName(name)
+				version, err = filler.Fill(params, req.URL.Query())
+				if err != nil {
+					slog.Warn(fmt.Sprintf("Failed to fill - likely missing http:// scheme - %s", err.Error()))
+				} else {
+					storeNewVersion(name, version)
+					val, ok = versions.Load(name)
+				}
+			}
+			if !ok {
+				http.Error(w, fmt.Sprintf("{\"error\": \"%s not found\"}", name), http.StatusNotFound)
+				return
+			}
 		}
-		version = val.(Version)
+		version = val.(api.Version)
 
 		v, ok := req.URL.Query()["version"]
 		if ok && len(v[0]) > 0 {
@@ -125,7 +140,7 @@ func version(w http.ResponseWriter, req *http.Request) {
 				if !ok {
 					http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
 				}
-				version = val.(Version)
+				version = val.(api.Version)
 				if jitterFor.Milliseconds() > 0 {
 					jitterDuration := rand.Int63n(jitterFor.Milliseconds())
 					w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
@@ -166,15 +181,24 @@ PUT /log?level=DEBUG                                     -> Set log level
 
 func main() {
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
+	flag.StringVar(&replicateWith, "replicate-with", replicateWith, "The comma separated list of addresses to replicate with")
+	flag.StringVar(&fillAddr, "fill-addr", fillAddr, "The address to fill from when a version is missing")
+	flag.StringVar(&fillPath, "fill-path", fillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
 	flag.DurationVar(&blockFor, "block-for", blockFor, "The duration to block GETs by default for")
 	flag.DurationVar(&jitterFor, "jitter-for", jitterFor, "The duration to jitter blocking GETs by, should be less than block-for")
 	flag.Parse()
 
+	if fillAddr != "" {
+		slog.Info("Creating filler")
+		client := &http.Client{
+			Timeout: blockFor * 2,
+		}
+		filler = &repl.Filler{Addr: fillAddr, Path: fillPath, Client: client}
+	}
 	http.HandleFunc("/version/{name...}", version)
 	http.HandleFunc("PUT /log", setLogLevel)
 
 	slog.Info(fmt.Sprintf("Listening at %s", listen))
-
 	slog.Info(paths)
 	err := http.ListenAndServe(listen, nil)
 	if err != nil {
