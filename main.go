@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -27,6 +28,7 @@ var (
 	logLevel      = new(slog.LevelVar)
 
 	filler    *repl.Filler = nil
+	gossiper  *repl.Gossiper = nil
 	versions  sync.Map
 	watchers  map[string]Watcher = make(map[string]Watcher)
 	watchLock sync.Mutex
@@ -184,7 +186,7 @@ PUT /log?level=DEBUG                                     -> Set log level
 
 func main() {
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
-	flag.StringVar(&replicateWith, "replicate-with", replicateWith, "The comma separated list of addresses to replicate with")
+	flag.StringVar(&replicateWith, "replicate-with", replicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
 	flag.StringVar(&fillAddr, "fill-addr", fillAddr, "The address to fill from when a version is missing")
 	flag.StringVar(&fillPath, "fill-path", fillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
 	flag.DurationVar(&blockFor, "block-for", blockFor, "The duration to block GETs by default for")
@@ -192,13 +194,25 @@ func main() {
 	flag.Parse()
 
 	if fillAddr != "" {
-		slog.Info("Creating filler")
+		slog.Info("Creating Filler to replicate from: " + fillAddr)
 		client := &http.Client{
 			Timeout: blockFor * 2,
 		}
 		monitor := &sync.Map{}
 		filler = &repl.Filler{Addr: fillAddr, Path: fillPath, Client: client, Monitor: monitor, Channel: make(chan string, 2)}
 		go filler.Watch(&versions, blockFor, storeNewVersion)
+	} else if replicateWith != "" {
+		slog.Info("Creating Gossiper to replicate with: " + replicateWith)
+		addrs := strings.Split(replicateWith, ",")
+		client := &http.Client{
+			Timeout: blockFor,
+		}
+		gossiper = &repl.Gossiper{
+			Addrs: addrs,
+			Client: client,
+			LocalState: &versions,
+		}
+		go gossiper.Gossip(storeNewVersion)
 	}
 	http.HandleFunc("/version/{name...}", version)
 	http.HandleFunc("PUT /log", setLogLevel)

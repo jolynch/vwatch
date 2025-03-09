@@ -98,10 +98,10 @@ func watch(filler Filler, name string, state *sync.Map, blockFor time.Duration, 
 		params := url.Values{}
 		params.Add("timeout", blockFor.String())
 		params.Add("version", nextVersion)
+		pv, prevVersionExists := state.Load(name)
 		version, err := filler.Fill(map[string]string {"name": name}, params)
 		if err != nil {
-			_, ok := state.Load(name)
-			if ok {
+			if prevVersionExists {
 				// Have observed a version in the past, need to keep watching in case it comes back
 				backoff := rand.Int63n(blockFor.Milliseconds())
 				slog.Warn(fmt.Sprintf("Failed while filling [%s], backing off %dms: %s", name, backoff, err.Error()))
@@ -114,10 +114,9 @@ func watch(filler Filler, name string, state *sync.Map, blockFor time.Duration, 
 			}
 		} else {
 			nextVersion = version.Version
-			pv, ok := state.LoadOrStore(name, version)
-			if ok {
-				prev := pv.(api.Version).LastSync.UnixNano()
-				if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+			if prevVersionExists {
+				prevTs := pv.(api.Version).LastSync.UnixNano()
+				if prevTs < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
 					slog.Info(fmt.Sprintf("Replacing state[%s] with newer version %s compared to %s", name, version, pv.(api.Version)))
 					go storeNewVersion(name, version)
 				}
