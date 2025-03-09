@@ -71,6 +71,10 @@ func version(w http.ResponseWriter, req *http.Request) {
 
 	switch req.Method {
 	case "PUT":
+		if filler != nil {
+			http.Error(w, "Replicating nodes cannot accept writes", http.StatusMethodNotAllowed)
+			return
+		}
 		var lastSync time.Time
 		json.NewDecoder(req.Body).Decode(&version)
 		version.Name = name
@@ -101,9 +105,7 @@ func version(w http.ResponseWriter, req *http.Request) {
 			if filler != nil {
 				params := util.ParseName(name)
 				version, err = filler.Fill(params, req.URL.Query())
-				if err != nil {
-					slog.Warn(fmt.Sprintf("Failed to fill - likely missing http:// scheme - %s", err.Error()))
-				} else {
+				if err == nil {
 					storeNewVersion(name, version)
 					val, ok = versions.Load(name)
 				}
@@ -134,6 +136,7 @@ func version(w http.ResponseWriter, req *http.Request) {
 				case <-time.After(timeout):
 					slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
 				}
+				// The update is holding a lock while waiting for this, so we need to release it asap.
 				watcher.WatchGroup.Done()
 
 				val, ok = versions.Load(name)
@@ -193,7 +196,9 @@ func main() {
 		client := &http.Client{
 			Timeout: blockFor * 2,
 		}
-		filler = &repl.Filler{Addr: fillAddr, Path: fillPath, Client: client}
+		monitor := &sync.Map{}
+		filler = &repl.Filler{Addr: fillAddr, Path: fillPath, Client: client, Monitor: monitor, Channel: make(chan string, 2)}
+		go filler.Watch(&versions, blockFor, storeNewVersion)
 	}
 	http.HandleFunc("/version/{name...}", version)
 	http.HandleFunc("PUT /log", setLogLevel)
