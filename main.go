@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -27,7 +28,7 @@ var (
 	jitterFor     = 1 * time.Second
 	logLevel      = new(slog.LevelVar)
 
-	filler    *repl.Filler = nil
+	filler    *repl.Filler   = nil
 	gossiper  *repl.Gossiper = nil
 	versions  sync.Map
 	watchers  map[string]Watcher = make(map[string]Watcher)
@@ -182,6 +183,7 @@ var paths = `Paths
 GET /version/{repository}[:{tag}]?[version=last_seen]    -> Get latest version or block for new version
 PUT /version/{repository}[:{tag}] {"version": <version>} -> Set latest version, unblocking watches
 PUT /log?level=DEBUG                                     -> Set log level
+PUT /replicate <- {"name1": "version1", "name2": ...}    -> Replicate state between leaders
 `
 
 func main() {
@@ -199,7 +201,13 @@ func main() {
 			Timeout: blockFor * 2,
 		}
 		monitor := &sync.Map{}
-		filler = &repl.Filler{Addr: fillAddr, Path: fillPath, Client: client, Monitor: monitor, Channel: make(chan string, 2)}
+		filler = &repl.Filler{
+			Addr:    fillAddr,
+			Path:    fillPath,
+			Client:  client,
+			Monitor: monitor,
+			Channel: make(chan string, 2),
+		}
 		go filler.Watch(&versions, blockFor, storeNewVersion)
 	} else if replicateWith != "" {
 		slog.Info("Creating Gossiper to replicate with: " + replicateWith)
@@ -208,9 +216,11 @@ func main() {
 			Timeout: blockFor,
 		}
 		gossiper = &repl.Gossiper{
-			Addrs: addrs,
-			Client: client,
+			Addrs:      addrs,
+			Peers:      make([]url.URL, len(addrs)),
+			Client:     client,
 			LocalState: &versions,
+	
 		}
 		go gossiper.Gossip(storeNewVersion)
 	}
