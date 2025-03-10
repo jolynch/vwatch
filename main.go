@@ -182,7 +182,7 @@ func setLogLevel(w http.ResponseWriter, req *http.Request) {
 var paths = `Paths
 GET /version/{repository}[:{tag}]?[version=last_seen]    -> Get latest version or block for new version
 PUT /version/{repository}[:{tag}] {"version": <version>} -> Set latest version, unblocking watches
-PUT /log?level=DEBUG                                     -> Set log level
+PUT /logging?level=DEBUG                                     -> Set log level
 PUT /replicate <- {"name1": "version1", "name2": ...}    -> Replicate state between leaders
 `
 
@@ -225,7 +225,7 @@ func main() {
 		go gossiper.Gossip(storeNewVersion)
 	}
 	http.HandleFunc("/version/{name...}", version)
-	http.HandleFunc("PUT /log", setLogLevel)
+	http.HandleFunc("PUT /logging", setLogLevel)
 
 	slog.Info(fmt.Sprintf("Listening at %s", listen))
 	slog.Info(paths)
