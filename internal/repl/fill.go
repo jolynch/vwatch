@@ -54,17 +54,14 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		return
 	}
 
-	lastSync := resp.Header.Get("Last-Modified")
-	if lastSync == "" {
-		err = errors.New("no Last-Modified header in response")
-		slog.Warn(fmt.Sprintf("Fill [%s] has %s", name, err.Error()))
-		return
-	}
-
-	lastSyncTs, err := time.Parse(http.TimeFormat, lastSync)
-	if err != nil {
-		slog.Warn(fmt.Sprintf("Fill [%s] invalid sync timestamp: %s", name, err.Error()))
-		return
+	lastSync := time.Now()
+	lastModified := resp.Header.Get("Last-Modified")
+	if lastModified != "" {
+		lastSync, err = time.Parse(http.TimeFormat, lastModified)
+		if err != nil {
+			slog.Warn(fmt.Sprintf("Fill [%s] invalid sync timestamp: %s", name, err.Error()))
+			return
+		}
 	}
 
 	data, err := io.ReadAll(resp.Body)
@@ -80,13 +77,12 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 	} else {
 		slog.Debug(fmt.Sprintf("Fill [%s] skipping monitor", name))
 	}
-	
 
 	return api.Version{
 		Name:     name,
 		Version:  rv,
-		LastSync: lastSyncTs,
-		Data: data,
+		LastSync: lastSync,
+		Data:     data,
 	}, nil
 }
 

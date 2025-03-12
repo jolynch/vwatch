@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"sync"
 	"time"
+
+	"github.com/jolynch/vwatch/internal/api"
 )
 
 type Gossiper struct {
@@ -58,13 +60,33 @@ func (gossiper Gossiper) findPeers() {
 			slog.Warn(fmt.Sprintf("Gossiper failed to parse address [%s]: %s", addr, err))
 		}
 	}
-
 }
 
-func (gossiper Gossiper) Gossip(storeVersion update) {
+func (gossiper Gossiper) Replicate(storeVersion update, replicateInterval time.Duration) {
+	var i int64 = 0
 	for {
-		time.Sleep(1 * time.Second)
+		peers := gossiper.Peers
+		peer := peers[i%int64(len(peers))]
+
+		slog.Info("Gossip with :" + peer.Host)
+		var myVersions []api.Version
+		gossiper.LocalState.Range(func(key, value any) bool {
+			name := value.(api.Version).Name
+			version := value.(api.Version).Version
+			ts := value.(api.Version).LastSync
+			myVersions = append(myVersions, api.Version{Name: name, Version: version, LastSync: ts})
+			return true
+		})
+		time.Sleep(replicateInterval)
+		i++
+	}
+}
+
+func (gossiper Gossiper) Gossip(storeVersion update, replicateInterval, refreshInterval time.Duration) {
+	go gossiper.Replicate(storeVersion, replicateInterval)
+	for {
 		gossiper.findPeers()
-		slog.Info(fmt.Sprintf("%+v", gossiper.Peers))
+		slog.Info(fmt.Sprintf("Peers: %+v", gossiper.Peers))
+		time.Sleep(refreshInterval)
 	}
 }

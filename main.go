@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/gob"
 	"flag"
 	"fmt"
 	"hash/crc32"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+
 	"github.com/jolynch/vwatch/internal"
 	"github.com/jolynch/vwatch/internal/api"
 	"github.com/jolynch/vwatch/internal/repl"
@@ -20,14 +22,16 @@ import (
 )
 
 var (
-	listen         = "127.0.0.1:8080"
-	replicateWith  = ""
-	fillAddr       = ""
-	fillPath       = "/version/${name}"
-	blockFor       = 10 * time.Second
-	jitterFor      = 1 * time.Second
-	logLevel       = new(slog.LevelVar)
-	dataLimitBytes = 4096
+	listen                = "127.0.0.1:8080"
+	replicateWith         = ""
+	replicateEvery        = 1 * time.Second
+	replicateResolveEvery = 10 * time.Second
+	fillAddr              = ""
+	fillPath              = "/version/${name}"
+	blockFor              = 10 * time.Second
+	jitterFor             = 1 * time.Second
+	logLevel              = new(slog.LevelVar)
+	dataLimitBytes        = 4096
 
 	filler    *repl.Filler
 	gossiper  *repl.Gossiper
@@ -67,9 +71,9 @@ func storeNewVersion(name string, version api.Version) {
 
 func putVersion(w http.ResponseWriter, req *http.Request) {
 	var (
-		name string = req.PathValue("name")
+		name    string = req.PathValue("name")
 		version api.Version
-		err error
+		err     error
 	)
 
 	if filler != nil {
@@ -87,7 +91,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	if m != "" {
 		version.LastSync, err = time.Parse(http.TimeFormat, m)
 		if err != nil {
-			http.Error(w, "Invalid RFC1123 GMT Last-Modified header provided: " + err.Error(), http.StatusBadRequest)
+			http.Error(w, "Invalid RFC1123 GMT Last-Modified header provided: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 	} else {
@@ -95,7 +99,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		if ok && len(v[0]) >= 0 {
 			version.LastSync, err = time.Parse(time.RFC3339, v[0])
 			if err != nil {
-				http.Error(w, "Invalid RFC3339 modified url parameter provided: " + err.Error(), http.StatusBadRequest)
+				http.Error(w, "Invalid RFC3339 modified url parameter provided: "+err.Error(), http.StatusBadRequest)
 				return
 			}
 		} else {
@@ -108,12 +112,12 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	if ok && len(v[0]) > 0 {
 		version.Version = v[0]
 	}
-	
+
 	// Data comes from the first dataLimitBytes of the request body
 	buf := make([]byte, dataLimitBytes)
 	n, err := io.ReadFull(req.Body, buf)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
-		http.Error(w, "Error while reading body: " + err.Error(), http.StatusBadRequest)
+		http.Error(w, "Error while reading body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
 	version.Data = buf[:n]
@@ -122,7 +126,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		checksum := crc32.ChecksumIEEE(version.Data)
 		version.Version = fmt.Sprintf("%08x", checksum)
 	}
-	
+
 	pv, ok := versions.Load(name)
 	if ok {
 		prev := pv.(api.Version).LastSync.UnixNano()
@@ -210,6 +214,23 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	w.Write(version.Data)
 }
 
+func replicate(w http.ResponseWriter, req *http.Request) {
+	decoder := gob.NewDecoder(req.Body)
+	var versions []api.Version
+	err := decoder.Decode(&versions)
+	if err != nil {
+		http.Error(w, "Failed decoding gob data", http.StatusBadRequest)
+		return
+	}
+	for _, v := range versions {
+		slog.Info(v.Name + "->" + v.Version)
+	}
+
+	var deltas []api.Version
+	w.Header().Set("Content-Type", "application/octet-stream")
+	gob.NewEncoder(w).Encode(deltas)
+}
+
 func setLogLevel(w http.ResponseWriter, req *http.Request) {
 	level, ok := req.URL.Query()["level"]
 	if ok {
@@ -237,6 +258,9 @@ PUT /replicate                            <- gob(version)    -> Replicate state 
 func main() {
 	flag.StringVar(&listen, "listen", listen, "The address to listen on")
 	flag.StringVar(&replicateWith, "replicate-with", replicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
+	flag.DurationVar(&replicateEvery, "replicate-interval", replicateEvery, "How often to exchange state with peers")
+	flag.DurationVar(&replicateResolveEvery, "replicate-resolve-interval", replicateResolveEvery, "How often to resolve replicate-with to find peers")
+
 	flag.StringVar(&fillAddr, "fill-addr", fillAddr, "The address to fill from when a version is missing")
 	flag.StringVar(&fillPath, "fill-path", fillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
 	flag.IntVar(&dataLimitBytes, "data-limit", dataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
@@ -270,11 +294,12 @@ func main() {
 			Client:     client,
 			LocalState: &versions,
 		}
-		go gossiper.Gossip(storeNewVersion)
+		go gossiper.Gossip(storeNewVersion, replicateEvery, replicateResolveEvery)
 	}
 	http.HandleFunc("PUT /version/{name...}", putVersion)
 	http.HandleFunc("GET /version/{name...}", getVersion)
 	http.HandleFunc("PUT /logging", setLogLevel)
+	http.HandleFunc("PUT /replicate", replicate)
 
 	slog.Info(fmt.Sprintf("Listening at %s", listen))
 	slog.Info(paths)
