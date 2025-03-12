@@ -3,10 +3,11 @@ package repl
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math/rand"
 	"net/http"
 	"net/url"
-	"math/rand"
 	"sync"
 	"time"
 
@@ -15,9 +16,9 @@ import (
 )
 
 type Filler struct {
-	Addr string
-	Path string
-	Client *http.Client
+	Addr    string
+	Path    string
+	Client  *http.Client
 	Monitor *sync.Map
 	Channel chan string
 }
@@ -30,7 +31,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 	name := nameParams["name"]
 	urlPath := util.ExpandPattern(filler.Path, nameParams)
 	slog.Debug(fmt.Sprintf("Fill [%s] expanded url to: %s", name, urlPath))
-	
+
 	filled, err := url.JoinPath(filler.Addr, urlPath)
 	if err != nil {
 		slog.Warn(fmt.Sprintf("Fill [%s] url missing http:// in fill-addr: %s", name, err.Error()))
@@ -39,7 +40,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 	if len(httpParams) > 0 {
 		filled = fmt.Sprintf("%s?%s", filled, httpParams.Encode())
 	}
-	slog.Info(fmt.Sprintf("Fill [%s] GET %s",  name, filled))
+	slog.Info(fmt.Sprintf("Fill [%s] GET %s", name, filled))
 	resp, err := filler.Client.Get(filled)
 	if err != nil {
 		slog.Warn(fmt.Sprintf("Fill [%s] GET call failed: %s", name, err.Error()))
@@ -66,6 +67,12 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		return
 	}
 
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Warn(fmt.Sprintf("Fill [%s] error while reading data: %s", name, err.Error()))
+		return
+	}
+
 	_, ok := filler.Monitor.LoadOrStore(name, nil)
 	if !ok {
 		slog.Info(fmt.Sprintf("Fill [%s] enqueueing monitor", name))
@@ -73,11 +80,13 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 	} else {
 		slog.Debug(fmt.Sprintf("Fill [%s] skipping monitor", name))
 	}
+	
 
 	return api.Version{
-		Name: name,
-		Version: rv,
-		LastSync: &lastSyncTs, 
+		Name:     name,
+		Version:  rv,
+		LastSync: lastSyncTs,
+		Data: data,
 	}, nil
 }
 
@@ -86,8 +95,8 @@ type update func(string, api.Version)
 func (filler Filler) Watch(state *sync.Map, blockFor time.Duration, newVersion update) {
 	slog.Info("Starting Filler Watch")
 	for {
-		name := <- filler.Channel
-		slog.Info("Spawning Watcher for: [" + name + "]") 
+		name := <-filler.Channel
+		slog.Info("Spawning Watcher for: [" + name + "]")
 		go watch(filler, name, state, blockFor, newVersion)
 	}
 }
@@ -99,13 +108,13 @@ func watch(filler Filler, name string, state *sync.Map, blockFor time.Duration, 
 		params.Add("timeout", blockFor.String())
 		params.Add("version", nextVersion)
 		pv, prevVersionExists := state.Load(name)
-		version, err := filler.Fill(map[string]string {"name": name}, params)
+		version, err := filler.Fill(map[string]string{"name": name}, params)
 		if err != nil {
 			if prevVersionExists {
 				// Have observed a version in the past, need to keep watching in case it comes back
 				backoff := rand.Int63n(blockFor.Milliseconds())
 				slog.Warn(fmt.Sprintf("Failed while filling [%s], backing off %dms: %s", name, backoff, err.Error()))
-				time.Sleep(time.Duration(backoff) * time.Millisecond) 
+				time.Sleep(time.Duration(backoff) * time.Millisecond)
 			} else {
 				// Have never received a valid version, we cannot watch it yet, let another request attempt to get it
 				slog.Warn("Watch for [%s] terminating due to no version")

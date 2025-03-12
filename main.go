@@ -1,9 +1,9 @@
 package main
 
 import (
-	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -13,26 +13,27 @@ import (
 	"strings"
 	"sync"
 	"time"
-
+	"github.com/jolynch/vwatch/internal"
 	"github.com/jolynch/vwatch/internal/api"
 	"github.com/jolynch/vwatch/internal/repl"
 	"github.com/jolynch/vwatch/internal/util"
 )
 
 var (
-	listen        = "127.0.0.1:8080"
-	replicateWith = ""
-	fillAddr      = ""
-	fillPath      = "/version/${name}"
-	blockFor      = 10 * time.Second
-	jitterFor     = 1 * time.Second
-	logLevel      = new(slog.LevelVar)
+	listen         = "127.0.0.1:8080"
+	replicateWith  = ""
+	fillAddr       = ""
+	fillPath       = "/version/${name}"
+	blockFor       = 10 * time.Second
+	jitterFor      = 1 * time.Second
+	logLevel       = new(slog.LevelVar)
+	dataLimitBytes = 4096
 
-	filler    *repl.Filler   = nil
-	gossiper  *repl.Gossiper = nil
+	filler    *repl.Filler
+	gossiper  *repl.Gossiper
 	versions  sync.Map
-	watchers  map[string]Watcher = make(map[string]Watcher)
 	watchLock sync.Mutex
+	watchers  map[string]Watcher = make(map[string]Watcher)
 )
 
 type Watcher struct {
@@ -64,7 +65,79 @@ func storeNewVersion(name string, version api.Version) {
 	}
 }
 
-func version(w http.ResponseWriter, req *http.Request) {
+func putVersion(w http.ResponseWriter, req *http.Request) {
+	var (
+		name string = req.PathValue("name")
+		version api.Version
+		err error
+	)
+
+	if filler != nil {
+		http.Error(w, "Replicating nodes cannot accept writes", http.StatusMethodNotAllowed)
+		return
+	}
+	// Name always comes from URL
+	version.Name = name
+
+	// Last Modified comes from one of three places
+	// 1. Last-Modified header in RFC1123 GMT encoding
+	// 2. "modified" URL paremeter in RFC3339 encoding
+	// 3. Falls back to the current server time
+	m := req.Header.Get(headers.LastModified)
+	if m != "" {
+		version.LastSync, err = time.Parse(http.TimeFormat, m)
+		if err != nil {
+			http.Error(w, "Invalid RFC1123 GMT Last-Modified header provided: " + err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		v, ok := req.URL.Query()["modified"]
+		if ok && len(v[0]) >= 0 {
+			version.LastSync, err = time.Parse(time.RFC3339, v[0])
+			if err != nil {
+				http.Error(w, "Invalid RFC3339 modified url parameter provided: " + err.Error(), http.StatusBadRequest)
+				return
+			}
+		} else {
+			version.LastSync = time.Now()
+		}
+	}
+
+	// Try to get Version from the version URL parameter
+	v, ok := req.URL.Query()["version"]
+	if ok && len(v[0]) > 0 {
+		version.Version = v[0]
+	}
+	
+	// Data comes from the first dataLimitBytes of the request body
+	buf := make([]byte, dataLimitBytes)
+	n, err := io.ReadFull(req.Body, buf)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		http.Error(w, "Error while reading body: " + err.Error(), http.StatusBadRequest)
+		return
+	}
+	version.Data = buf[:n]
+
+	if version.Version == "" {
+		checksum := crc32.ChecksumIEEE(version.Data)
+		version.Version = fmt.Sprintf("%08x", checksum)
+	}
+	
+	pv, ok := versions.Load(name)
+	if ok {
+		prev := pv.(api.Version).LastSync.UnixNano()
+		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+			storeNewVersion(name, version)
+		}
+	} else {
+		storeNewVersion(name, version)
+	}
+	w.Header().Set(headers.ETag, version.Version)
+	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func getVersion(w http.ResponseWriter, req *http.Request) {
 	var (
 		timeout time.Duration = blockFor
 		err     error
@@ -72,96 +145,69 @@ func version(w http.ResponseWriter, req *http.Request) {
 		name    string = req.PathValue("name")
 	)
 
-	switch req.Method {
-	case "PUT":
-		if filler != nil {
-			http.Error(w, "Replicating nodes cannot accept writes", http.StatusMethodNotAllowed)
+	t, ok := req.URL.Query()["timeout"]
+	if ok && len(t[0]) >= 0 {
+		timeout, err = time.ParseDuration(t[0])
+		if err != nil {
+			http.Error(w, "Invalid timeout duration, try something like 10s", http.StatusBadRequest)
 			return
 		}
-		var lastSync time.Time
-		json.NewDecoder(req.Body).Decode(&version)
-		version.Name = name
-		if version.LastSync == nil {
-			lastSync = time.Now()
-			version.LastSync = &lastSync
-		}
-		pv, ok := versions.Load(name)
-		if ok {
-			prev := pv.(api.Version).LastSync.UnixNano()
-			if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
-				go storeNewVersion(name, version)
-			}
-		} else {
-			go storeNewVersion(name, version)
-		}
-	case "GET":
-		t, ok := req.URL.Query()["timeout"]
-		if ok && len(t[0]) >= 0 {
-			timeout, err = time.ParseDuration(t[0])
-			if err != nil {
-				http.Error(w, "Invalid timeout duration, try something like 10s", http.StatusBadRequest)
-				return
-			}
-		}
-		val, ok := versions.Load(name)
-		if !ok {
-			if filler != nil {
-				params := util.ParseName(name)
-				version, err = filler.Fill(params, req.URL.Query())
-				if err == nil {
-					storeNewVersion(name, version)
-					val, ok = versions.Load(name)
-				}
-			}
-			if !ok {
-				http.Error(w, fmt.Sprintf("{\"error\": \"%s not found\"}", name), http.StatusNotFound)
-				return
-			}
-		}
-		version = val.(api.Version)
-
-		v, ok := req.URL.Query()["version"]
-		if ok && len(v[0]) > 0 {
-			// Long poll
-			if v[0] == version.Version {
-				watchLock.Lock()
-				watcher, ok := watchers[name]
-				if !ok {
-					watcher = makeWatcher()
-					watchers[name] = watcher
-				}
-				watcher.WatchGroup.Add(1)
-				watchLock.Unlock()
-
-				select {
-				case <-watcher.Signal:
-					slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to signal", name))
-				case <-time.After(timeout):
-					slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
-				}
-				// The update is holding a lock while waiting for this, so we need to release it asap.
-				watcher.WatchGroup.Done()
-
+	}
+	val, ok := versions.Load(name)
+	if !ok {
+		if filler != nil {
+			params := util.ParseName(name)
+			version, err = filler.Fill(params, req.URL.Query())
+			if err == nil {
+				storeNewVersion(name, version)
 				val, ok = versions.Load(name)
-				if !ok {
-					http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
-				}
-				version = val.(api.Version)
-				if jitterFor.Milliseconds() > 0 {
-					jitterDuration := rand.Int63n(jitterFor.Milliseconds())
-					w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
-					time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
-				}
 			}
 		}
-	default:
-		http.Error(w, "/version supports only GET and PUT", http.StatusBadRequest)
-		return
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+	}
+	version = val.(api.Version)
+
+	v, ok := req.URL.Query()["version"]
+	if ok && len(v[0]) > 0 {
+		// Long poll
+		if v[0] == version.Version {
+			watchLock.Lock()
+			watcher, ok := watchers[name]
+			if !ok {
+				watcher = makeWatcher()
+				watchers[name] = watcher
+			}
+			watcher.WatchGroup.Add(1)
+			watchLock.Unlock()
+
+			select {
+			case <-watcher.Signal:
+				slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to signal", name))
+			case <-time.After(timeout):
+				slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
+			}
+			// The update is holding a lock while waiting for this, so we need to release it asap.
+			watcher.WatchGroup.Done()
+
+			val, ok = versions.Load(name)
+			if !ok {
+				http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
+			}
+			version = val.(api.Version)
+			if jitterFor.Milliseconds() > 0 {
+				jitterDuration := rand.Int63n(jitterFor.Milliseconds())
+				w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
+				time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
+			}
+		}
 	}
 
-	w.Header().Set("ETag", version.Version)
-	w.Header().Set("Last-Modified", version.LastSync.UTC().Format(http.TimeFormat))
-	io.WriteString(w, version.Version)
+	w.Header().Set(headers.ETag, version.Version)
+	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
+	w.Write(version.Data)
 }
 
 func setLogLevel(w http.ResponseWriter, req *http.Request) {
@@ -180,10 +226,12 @@ func setLogLevel(w http.ResponseWriter, req *http.Request) {
 }
 
 var paths = `Paths
-GET /version/{repository}[:{tag}]?[version=last_seen]    -> Get latest version or block for new version
-PUT /version/{repository}[:{tag}] {"version": <version>} -> Set latest version, unblocking watches
+GET /version/{repository}[:{tag}]?[version=last_seen]        -> Get latest version or block for new version
+PUT /version/{repository}[:{tag}]?[version=version <- <data> -> Set latest version, unblocking watches
 PUT /logging?level=DEBUG                                     -> Set log level
-PUT /replicate <- {"name1": "version1", "name2": ...}    -> Replicate state between leaders
+
+Internal endpoints you should probably avoid unless you know what you are doing
+PUT /replicate                            <- gob(version)    -> Replicate state between leaders
 `
 
 func main() {
@@ -191,6 +239,7 @@ func main() {
 	flag.StringVar(&replicateWith, "replicate-with", replicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
 	flag.StringVar(&fillAddr, "fill-addr", fillAddr, "The address to fill from when a version is missing")
 	flag.StringVar(&fillPath, "fill-path", fillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
+	flag.IntVar(&dataLimitBytes, "data-limit", dataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
 	flag.DurationVar(&blockFor, "block-for", blockFor, "The duration to block GETs by default for")
 	flag.DurationVar(&jitterFor, "jitter-for", jitterFor, "The duration to jitter blocking GETs by, should be less than block-for")
 	flag.Parse()
@@ -220,11 +269,11 @@ func main() {
 			Peers:      make([]url.URL, len(addrs)),
 			Client:     client,
 			LocalState: &versions,
-	
 		}
 		go gossiper.Gossip(storeNewVersion)
 	}
-	http.HandleFunc("/version/{name...}", version)
+	http.HandleFunc("PUT /version/{name...}", putVersion)
+	http.HandleFunc("GET /version/{name...}", getVersion)
 	http.HandleFunc("PUT /logging", setLogLevel)
 
 	slog.Info(fmt.Sprintf("Listening at %s", listen))

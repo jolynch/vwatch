@@ -11,16 +11,16 @@ import (
 )
 
 type Gossiper struct {
-	Addrs []string
-	Client *http.Client
+	Addrs      []string
+	Client     *http.Client
 	LocalState *sync.Map
-	Peers [] url.URL
+	Peers      []url.URL
 }
 
 func (gossiper Gossiper) findPeers() {
 	for _, addr := range gossiper.Addrs {
 		peers := make([]url.URL, len(gossiper.Addrs))
-		u, err := url.Parse(addr);
+		u, err := url.Parse(addr)
 		if err == nil {
 			host, port, err := net.SplitHostPort(u.Host)
 			if err != nil {
@@ -29,7 +29,7 @@ func (gossiper Gossiper) findPeers() {
 			}
 			ips, err := net.LookupIP(host)
 			if err == nil {
-				for _, ip := range(ips) {
+				for _, ip := range ips {
 					newHost := ip.String()
 					if ip.To4() == nil {
 						newHost = fmt.Sprintf("[%s]", newHost)
@@ -40,8 +40,8 @@ func (gossiper Gossiper) findPeers() {
 
 					peers = append(peers, url.URL{
 						Scheme: u.Scheme,
-						Host: newHost,
-						Path: "/replicate",
+						Host:   newHost,
+						Path:   "/replicate",
 					})
 				}
 			} else {
@@ -58,7 +58,7 @@ func (gossiper Gossiper) findPeers() {
 			slog.Warn(fmt.Sprintf("Gossiper failed to parse address [%s]: %s", addr, err))
 		}
 	}
-	
+
 }
 
 func (gossiper Gossiper) Gossip(storeVersion update) {
