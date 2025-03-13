@@ -4,7 +4,6 @@ import (
 	"encoding/gob"
 	"flag"
 	"fmt"
-	"hash/crc32"
 	"io"
 	"log/slog"
 	"math/rand"
@@ -18,6 +17,7 @@ import (
 	"github.com/jolynch/vwatch/internal/api"
 	"github.com/jolynch/vwatch/internal/repl"
 	"github.com/jolynch/vwatch/internal/util"
+	"github.com/zeebo/xxh3"
 )
 
 var (
@@ -123,8 +123,8 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	version.Data = buf[:n]
 
 	if version.Version == "" {
-		checksum := crc32.ChecksumIEEE(version.Data)
-		version.Version = fmt.Sprintf("%08x", checksum)
+		checksum := xxh3.Hash128(version.Data)
+		version.Version = fmt.Sprintf("%08x%08x", checksum.Hi, checksum.Lo)
 	}
 
 	upsertVersion(name, version)
