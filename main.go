@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -53,7 +52,7 @@ func makeWatcher() Watcher {
 	return Watcher{WatchGroup: &wg, Signal: ch}
 }
 
-func storeNewVersion(name string, version api.Version) {
+func storeNewVersion(name string, version api.Version) bool {
 	versions.Store(name, version)
 
 	watchLock.Lock()
@@ -67,6 +66,7 @@ func storeNewVersion(name string, version api.Version) {
 		close(watcher.Signal)
 		watcher.WatchGroup.Wait()
 	}
+	return true
 }
 
 func putVersion(w http.ResponseWriter, req *http.Request) {
@@ -127,15 +127,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		version.Version = fmt.Sprintf("%08x", checksum)
 	}
 
-	pv, ok := versions.Load(name)
-	if ok {
-		prev := pv.(api.Version).LastSync.UnixNano()
-		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
-			storeNewVersion(name, version)
-		}
-	} else {
-		storeNewVersion(name, version)
-	}
+	upsertVersion(name, version)
 	w.Header().Set(headers.ETag, version.Version)
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusNoContent)
@@ -211,22 +203,54 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 
 	w.Header().Set(headers.ETag, version.Version)
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
+	w.Header().Set(headers.ContentType, "application/octet-stream")
 	w.Write(version.Data)
+}
+
+func upsertVersion(name string, version api.Version) bool {
+	pv, ok := versions.Load(name)
+	if ok {
+		prev := pv.(api.Version).LastSync.UnixNano()
+		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+			storeNewVersion(name, version)
+			return true
+		}
+		return false
+	} else {
+		storeNewVersion(name, version)
+		return true
+	}
 }
 
 func replicate(w http.ResponseWriter, req *http.Request) {
 	decoder := gob.NewDecoder(req.Body)
-	var versions []api.Version
-	err := decoder.Decode(&versions)
+	var remoteVersions []api.Version
+	err := decoder.Decode(&remoteVersions)
 	if err != nil {
 		http.Error(w, "Failed decoding gob data", http.StatusBadRequest)
 		return
 	}
-	for _, v := range versions {
-		slog.Info(v.Name + "->" + v.Version)
-	}
-
+	var remoteKeys map[string]bool = make(map[string]bool)
 	var deltas []api.Version
+
+	for _, version := range remoteVersions {
+		remoteKeys[version.Name] = true
+		pv, ok := versions.Load(version.Name)
+		if ok {
+			prev := pv.(api.Version).LastSync.UnixNano()
+			if prev > version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+				deltas = append(deltas, pv.(api.Version))
+			}
+		}
+	}
+	versions.Range(func(key, value any) bool {
+		_, seen := remoteKeys[key.(string)]
+		if !seen {
+			deltas = append(deltas, value.(api.Version))
+		}
+		return true
+	})
+
 	w.Header().Set("Content-Type", "application/octet-stream")
 	gob.NewEncoder(w).Encode(deltas)
 }
@@ -252,7 +276,7 @@ PUT /version/{repository}[:{tag}]?[version=version <- <data> -> Set latest versi
 PUT /logging?level=DEBUG                                     -> Set log level
 
 Internal endpoints you should probably avoid unless you know what you are doing
-PUT /replicate                            <- gob(version)    -> Replicate state between leaders
+POST /replicate                            <- gob([]Version) -> Replicate state between leaders
 `
 
 func main() {
@@ -290,16 +314,15 @@ func main() {
 		}
 		gossiper = &repl.Gossiper{
 			Addrs:      addrs,
-			Peers:      make([]url.URL, len(addrs)),
 			Client:     client,
 			LocalState: &versions,
 		}
-		go gossiper.Gossip(storeNewVersion, replicateEvery, replicateResolveEvery)
+		go gossiper.Gossip(upsertVersion, replicateEvery, replicateResolveEvery)
 	}
 	http.HandleFunc("PUT /version/{name...}", putVersion)
 	http.HandleFunc("GET /version/{name...}", getVersion)
 	http.HandleFunc("PUT /logging", setLogLevel)
-	http.HandleFunc("PUT /replicate", replicate)
+	http.HandleFunc("POST /replicate", replicate)
 
 	slog.Info(fmt.Sprintf("Listening at %s", listen))
 	slog.Info(paths)

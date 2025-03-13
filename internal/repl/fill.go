@@ -86,7 +86,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 	}, nil
 }
 
-type update func(string, api.Version)
+type update func(string, api.Version) bool
 
 func (filler Filler) Watch(state *sync.Map, blockFor time.Duration, newVersion update) {
 	slog.Info("Starting Filler Watch")

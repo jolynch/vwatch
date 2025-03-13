@@ -1,11 +1,14 @@
 package repl
 
 import (
+	"bytes"
+	"encoding/gob"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
+	"reflect"
 	"sync"
 	"time"
 
@@ -16,12 +19,13 @@ type Gossiper struct {
 	Addrs      []string
 	Client     *http.Client
 	LocalState *sync.Map
-	Peers      []url.URL
+	PeerMutex  sync.RWMutex
+	Peers      []string
 }
 
-func (gossiper Gossiper) findPeers() {
+func (gossiper *Gossiper) findPeers() {
 	for _, addr := range gossiper.Addrs {
-		peers := make([]url.URL, len(gossiper.Addrs))
+		var peers []string
 		u, err := url.Parse(addr)
 		if err == nil {
 			host, port, err := net.SplitHostPort(u.Host)
@@ -39,20 +43,25 @@ func (gossiper Gossiper) findPeers() {
 					if port != "" {
 						newHost = fmt.Sprintf("%s:%s", newHost, port)
 					}
-
-					peers = append(peers, url.URL{
+					newURL := url.URL{
 						Scheme: u.Scheme,
 						Host:   newHost,
 						Path:   "/replicate",
-					})
+					}
+
+					peers = append(peers, newURL.String())
 				}
 			} else {
 				slog.Warn("Gossiper failed to lookup ips: " + err.Error())
 			}
 			// Always keep last peer around
 			if len(peers) > 0 {
-				slog.Info(fmt.Sprintf("Found %d peers", len(peers)))
-				gossiper.Peers = peers
+				gossiper.PeerMutex.Lock()
+				if !reflect.DeepEqual(peers, gossiper.Peers) {
+					slog.Info(fmt.Sprintf("Gossiper found %d peers %+v", len(peers), peers))
+					gossiper.Peers = peers
+				}
+				gossiper.PeerMutex.Unlock()
 			} else {
 				slog.Warn("Gossiper failed to resolve any peers")
 			}
@@ -62,31 +71,52 @@ func (gossiper Gossiper) findPeers() {
 	}
 }
 
-func (gossiper Gossiper) Replicate(storeVersion update, replicateInterval time.Duration) {
+func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time.Duration) {
 	var i int64 = 0
 	for {
-		peers := gossiper.Peers
-		peer := peers[i%int64(len(peers))]
+		gossiper.PeerMutex.RLock()
+		if len(gossiper.Peers) > 0 {
+			peer := gossiper.Peers[i%int64(len(gossiper.Peers))]
+			gossiper.PeerMutex.RUnlock()
 
-		slog.Info("Gossip with :" + peer.Host)
-		var myVersions []api.Version
-		gossiper.LocalState.Range(func(key, value any) bool {
-			name := value.(api.Version).Name
-			version := value.(api.Version).Version
-			ts := value.(api.Version).LastSync
-			myVersions = append(myVersions, api.Version{Name: name, Version: version, LastSync: ts})
-			return true
-		})
+			slog.Debug("Gossip with [" + peer + "]")
+			var myVersions []api.Version
+			gossiper.LocalState.Range(func(key, value any) bool {
+				name := value.(api.Version).Name
+				version := value.(api.Version).Version
+				ts := value.(api.Version).LastSync
+				myVersions = append(myVersions, api.Version{Name: name, Version: version, LastSync: ts})
+				return true
+			})
+			var buf bytes.Buffer
+			enc := gob.NewEncoder(&buf)
+			enc.Encode(myVersions)
+			resp, err := gossiper.Client.Post(peer, "application/octet-stream", &buf)
+			if err == nil {
+				var theirVersions []api.Version
+				gob.NewDecoder(resp.Body).Decode(&theirVersions)
+				for _, v := range theirVersions {
+					upsertVersion(v.Name, v)
+				}
+				if len(theirVersions) > 0 {
+					slog.Info(fmt.Sprintf("Peer sent %d new versions!", len(theirVersions)))
+				}
+			} else {
+				slog.Warn("Gossip failed with : " + err.Error())
+			}
+		} else {
+			gossiper.PeerMutex.RUnlock()
+		}
+
 		time.Sleep(replicateInterval)
 		i++
 	}
 }
 
-func (gossiper Gossiper) Gossip(storeVersion update, replicateInterval, refreshInterval time.Duration) {
+func (gossiper *Gossiper) Gossip(storeVersion update, replicateInterval, refreshInterval time.Duration) {
 	go gossiper.Replicate(storeVersion, replicateInterval)
 	for {
 		gossiper.findPeers()
-		slog.Info(fmt.Sprintf("Peers: %+v", gossiper.Peers))
 		time.Sleep(refreshInterval)
 	}
 }
