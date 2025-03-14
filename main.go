@@ -27,7 +27,7 @@ var (
 	replicateEvery        = 1 * time.Second
 	replicateResolveEvery = 10 * time.Second
 	fillAddr              = ""
-	fillPath              = "/version/${name}"
+	fillPath              = "/version/{{.name}}"
 	fillExpiry            = 10 * time.Second
 	fillStrategy          = repl.FillWatch
 	blockFor              = 10 * time.Second
@@ -41,7 +41,6 @@ var (
 	watchLock sync.Mutex
 	watchers  map[string]Watcher = make(map[string]Watcher)
 )
-
 
 type Watcher struct {
 	WatchGroup *sync.WaitGroup
@@ -80,7 +79,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		err     error
 	)
 
-	if filler != nil {
+	if filler != nil && fillStrategy == repl.FillWatch {
 		http.Error(w, "Replicating nodes cannot accept writes", http.StatusMethodNotAllowed)
 		return
 	}
@@ -170,38 +169,45 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	}
 	version = val.(api.Version)
 
-	v, ok := req.URL.Query()["version"]
-	if ok && len(v[0]) > 0 {
+	var previousVersion = ""
+	etag := req.Header.Get(headers.ETag)
+	if etag != "" {
+		previousVersion = etag
+	} else {
+		v, ok := req.URL.Query()["version"]
+		if ok && len(v[0]) > 0 {
+			previousVersion = v[0]
+		}
+	}
+	if previousVersion != "" && previousVersion == version.Version {
 		// Long poll
-		if v[0] == version.Version {
-			watchLock.Lock()
-			watcher, ok := watchers[name]
-			if !ok {
-				watcher = makeWatcher()
-				watchers[name] = watcher
-			}
-			watcher.WatchGroup.Add(1)
-			watchLock.Unlock()
+		watchLock.Lock()
+		watcher, ok := watchers[name]
+		if !ok {
+			watcher = makeWatcher()
+			watchers[name] = watcher
+		}
+		watcher.WatchGroup.Add(1)
+		watchLock.Unlock()
 
-			select {
-			case <-watcher.Signal:
-				slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to signal", name))
-			case <-time.After(timeout):
-				slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
-			}
-			// The update is holding a lock while waiting for this, so we need to release it asap.
-			watcher.WatchGroup.Done()
+		select {
+		case <-watcher.Signal:
+			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to signal", name))
+		case <-time.After(timeout):
+			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
+		}
+		// The update is holding a lock while waiting for this, so we need to release it asap.
+		watcher.WatchGroup.Done()
 
-			val, ok = versions.Load(name)
-			if !ok {
-				http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
-			}
-			version = val.(api.Version)
-			if jitterFor.Milliseconds() > 0 {
-				jitterDuration := rand.Int63n(jitterFor.Milliseconds())
-				w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
-				time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
-			}
+		val, ok = versions.Load(name)
+		if !ok {
+			http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
+		}
+		version = val.(api.Version)
+		if jitterFor.Milliseconds() > 0 {
+			jitterDuration := rand.Int63n(jitterFor.Milliseconds())
+			w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
+			time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
 		}
 	}
 
@@ -311,15 +317,16 @@ func main() {
 		}
 		monitor := &sync.Map{}
 		filler = &repl.Filler{
-			Addr:    fillAddr,
-			Path:    fillPath,
-			Client:  client,
-			Monitor: monitor,
-			Channel: make(chan map[string]string, 2),
+			Addr:     fillAddr,
+			Path:     fillPath,
+			Client:   client,
+			Monitor:  monitor,
+			Channel:  make(chan map[string]string, 2),
 			FillBody: fillStrategy == repl.FillWatch,
 		}
 		go filler.Watch(&versions, fillExpiry, storeNewVersion, fillStrategy)
-	} else if replicateWith != "" {
+	}
+	if replicateWith != "" {
 		slog.Info("Creating Gossiper to replicate with: " + replicateWith)
 		addrs := strings.Split(replicateWith, ",")
 		client := &http.Client{

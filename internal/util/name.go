@@ -1,8 +1,11 @@
 package util
 
 import (
-	"os"
+	"bytes"
+	"fmt"
+	"log/slog"
 	"strings"
+	"text/template"
 )
 
 func ParseName(name string) map[string]string {
@@ -21,8 +24,16 @@ func ParseName(name string) map[string]string {
 }
 
 func ExpandPattern(pattern string, params map[string]string) string {
-	mapper := func(param string) string {
-		return params[param]
+	tmpl, err := template.New("path").Parse(pattern)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Invalid template [%s]: %s", pattern, err.Error()))
+		return pattern
 	}
-	return os.Expand(pattern, mapper)
+	var buf bytes.Buffer
+	err = tmpl.Execute(&buf, params)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Failed to template [%s]: %s", pattern, err.Error()))
+		return pattern
+	}
+	return buf.String()
 }

@@ -25,12 +25,12 @@ var (
 )
 
 type Filler struct {
-	Addr    string
-	Path    string
+	Addr     string
+	Path     string
 	FillBody bool
-	Client  *http.Client
-	Monitor *sync.Map
-	Channel chan map[string]string
+	Client   *http.Client
+	Monitor  *sync.Map
+	Channel  chan map[string]string
 }
 
 func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (version api.Version, err error) {
@@ -82,7 +82,6 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 			return
 		}
 	}
-
 
 	_, ok := filler.Monitor.LoadOrStore(name, nil)
 	if !ok {
@@ -140,7 +139,7 @@ func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration
 					go storeNewVersion(name, version)
 				}
 			}
-			if (fillStrategy == FillCache) {
+			if fillStrategy == FillCache {
 				time.Sleep(fillExpiry)
 			}
 		}

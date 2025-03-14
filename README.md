@@ -46,7 +46,7 @@ $ curl -XGET 127.0.0.1:8080/version/repo/artifact:latest -v
 < Last-Modified: Thu, 13 Mar 2025 03:48:12 GMT
 < Date: Thu, 13 Mar 2025 03:50:09 GMT
 < Content-Length: 4
-< 
+<
 * Connection #0 to host 127.0.0.1 left intact
 3456
 ```
@@ -74,7 +74,7 @@ The blocking read now unblocks with the new version
 < Last-Modified: Thu, 13 Mar 2025 03:52:17 GMT
 < Date: Thu, 13 Mar 2025 03:52:18 GMT
 < Content-Length: 4
-< 
+<
 * Connection #0 to host 127.0.0.1 left intact
 1234
 ```
@@ -98,3 +98,20 @@ $ ./vwatch -listen 127.0.0.2:8080 --replicate-with http://127.0.0.1:8080
 
 Now you can write to one, and read from either. You can also point it at a DNS name that contains all your IPs and those will
 automatically be resolved and replicated with.
+
+## Watching an upstream docker registry
+
+Filling with strategy CACHE allows you to fill from an upstream source like a docker registry v2 (anything that returns etags). You can use `{{.name}}`, `{{.repostory}}` or `{{.tag}}`
+in your URL construction. Example with an active-active pair running against each other:
+
+```bash
+./vwatch -listen 127.0.0.1:8080 -fill-addr "<registry>" -fill-path '/v2/{{.repository}}/manifests/{{.tag}}' -fill-strategy FILL_CACHE
+```
+
+Now the following will reach to the upstream registry and get the etag
+```bash
+curl -XGET '127.0.0.1:8080/version/repo/image:tag'
+...
+< Etag: "sha256:55109e781866b8bfb846e1f9ebf5da5b1db05be57ca0f005944b721706b79b92"
+< Last-Modified: Fri, 14 Mar 2025 22:10:48 GMT
+```
