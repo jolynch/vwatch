@@ -15,12 +15,22 @@ import (
 	"github.com/jolynch/vwatch/internal/util"
 )
 
+const (
+	FillWatch = "FILL_WATCH"
+	FillCache = "FILL_CACHE"
+)
+
+var (
+	ValidFillStrategies = []string{FillCache, FillWatch}
+)
+
 type Filler struct {
 	Addr    string
 	Path    string
+	FillBody bool
 	Client  *http.Client
 	Monitor *sync.Map
-	Channel chan string
+	Channel chan map[string]string
 }
 
 func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (version api.Version, err error) {
@@ -64,16 +74,20 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		}
 	}
 
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		slog.Warn(fmt.Sprintf("Fill [%s] error while reading data: %s", name, err.Error()))
-		return
+	var data []byte
+	if filler.FillBody {
+		data, err = io.ReadAll(resp.Body)
+		if err != nil {
+			slog.Warn(fmt.Sprintf("Fill [%s] error while reading data: %s", name, err.Error()))
+			return
+		}
 	}
+
 
 	_, ok := filler.Monitor.LoadOrStore(name, nil)
 	if !ok {
 		slog.Info(fmt.Sprintf("Fill [%s] enqueueing monitor", name))
-		filler.Channel <- name
+		filler.Channel <- nameParams
 	} else {
 		slog.Debug(fmt.Sprintf("Fill [%s] skipping monitor", name))
 	}
@@ -88,27 +102,27 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 
 type update func(string, api.Version) bool
 
-func (filler Filler) Watch(state *sync.Map, blockFor time.Duration, newVersion update) {
+func (filler Filler) Watch(state *sync.Map, fillExpiry time.Duration, newVersion update, fillStrategy string) {
 	slog.Info("Starting Filler Watch")
 	for {
-		name := <-filler.Channel
-		slog.Info("Spawning Watcher for: [" + name + "]")
-		go watch(filler, name, state, blockFor, newVersion)
+		params := <-filler.Channel
+		slog.Info("Spawning Watcher for: [" + params["name"] + "]")
+		go watch(filler, params["name"], state, fillExpiry, newVersion, fillStrategy, params)
 	}
 }
 
-func watch(filler Filler, name string, state *sync.Map, blockFor time.Duration, storeNewVersion update) {
+func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration, storeNewVersion update, fillStrategy string, nameParams map[string]string) {
 	nextVersion := ""
 	for {
 		params := url.Values{}
-		params.Add("timeout", blockFor.String())
+		params.Add("timeout", fillExpiry.String())
 		params.Add("version", nextVersion)
 		pv, prevVersionExists := state.Load(name)
-		version, err := filler.Fill(map[string]string{"name": name}, params)
+		version, err := filler.Fill(nameParams, params)
 		if err != nil {
 			if prevVersionExists {
 				// Have observed a version in the past, need to keep watching in case it comes back
-				backoff := rand.Int63n(blockFor.Milliseconds())
+				backoff := rand.Int63n(fillExpiry.Milliseconds())
 				slog.Warn(fmt.Sprintf("Failed while filling [%s], backing off %dms: %s", name, backoff, err.Error()))
 				time.Sleep(time.Duration(backoff) * time.Millisecond)
 			} else {
@@ -125,6 +139,9 @@ func watch(filler Filler, name string, state *sync.Map, blockFor time.Duration, 
 					slog.Info(fmt.Sprintf("Replacing state[%s] with newer version %s compared to %s", name, version, pv.(api.Version)))
 					go storeNewVersion(name, version)
 				}
+			}
+			if (fillStrategy == FillCache) {
+				time.Sleep(fillExpiry)
 			}
 		}
 	}

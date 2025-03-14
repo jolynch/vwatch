@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,8 @@ var (
 	replicateResolveEvery = 10 * time.Second
 	fillAddr              = ""
 	fillPath              = "/version/${name}"
+	fillExpiry            = 10 * time.Second
+	fillStrategy          = repl.FillWatch
 	blockFor              = 10 * time.Second
 	jitterFor             = 1 * time.Second
 	logLevel              = new(slog.LevelVar)
@@ -38,6 +41,7 @@ var (
 	watchLock sync.Mutex
 	watchers  map[string]Watcher = make(map[string]Watcher)
 )
+
 
 type Watcher struct {
 	WatchGroup *sync.WaitGroup
@@ -124,7 +128,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 
 	if version.Version == "" {
 		checksum := xxh3.Hash128(version.Data)
-		version.Version = fmt.Sprintf("%08x%08x", checksum.Hi, checksum.Lo)
+		version.Version = fmt.Sprintf("xxh3:%08x%08x", checksum.Hi, checksum.Lo)
 	}
 
 	upsertVersion(name, version)
@@ -287,10 +291,18 @@ func main() {
 
 	flag.StringVar(&fillAddr, "fill-addr", fillAddr, "The address to fill from when a version is missing")
 	flag.StringVar(&fillPath, "fill-path", fillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
+	flag.DurationVar(&fillExpiry, "fill-expiry", fillExpiry, "Ask the upstream at least once every interval, for example 10s we would ask upstream every 10s")
+	flag.StringVar(&fillStrategy, "fill-strategy", fillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
 	flag.IntVar(&dataLimitBytes, "data-limit", dataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
 	flag.DurationVar(&blockFor, "block-for", blockFor, "The duration to block GETs by default for")
 	flag.DurationVar(&jitterFor, "jitter-for", jitterFor, "The duration to jitter blocking GETs by, should be less than block-for")
 	flag.Parse()
+
+	badStrategy := slices.Contains(repl.ValidFillStrategies, fillStrategy)
+	if !badStrategy {
+		slog.Error(fmt.Sprintf("Bad -fill-strategy, passed %s but only support %v", fillStrategy, repl.ValidFillStrategies))
+		os.Exit(1)
+	}
 
 	if fillAddr != "" {
 		slog.Info("Creating Filler to replicate from: " + fillAddr)
@@ -303,9 +315,10 @@ func main() {
 			Path:    fillPath,
 			Client:  client,
 			Monitor: monitor,
-			Channel: make(chan string, 2),
+			Channel: make(chan map[string]string, 2),
+			FillBody: fillStrategy == repl.FillWatch,
 		}
-		go filler.Watch(&versions, blockFor, storeNewVersion)
+		go filler.Watch(&versions, fillExpiry, storeNewVersion, fillStrategy)
 	} else if replicateWith != "" {
 		slog.Info("Creating Gossiper to replicate with: " + replicateWith)
 		addrs := strings.Split(replicateWith, ",")
