@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"github.com/jolynch/vwatch/internal/api"
-	"github.com/jolynch/vwatch/internal/util"
+	"github.com/jolynch/vwatch/internal/parse"
 )
 
 const (
@@ -39,7 +39,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		return
 	}
 	name := nameParams["name"]
-	urlPath := util.ExpandPattern(filler.Path, nameParams)
+	urlPath := parse.ExpandPattern(filler.Path, nameParams)
 	slog.Debug(fmt.Sprintf("Fill [%s] expanded url to: %s", name, urlPath))
 
 	filled, err := url.JoinPath(filler.Addr, urlPath)
@@ -57,12 +57,13 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		return
 	}
 
-	rv := resp.Header.Get("ETag")
-	if rv == "" {
+	remoteVersion := resp.Header.Get("ETag")
+	if remoteVersion == "" {
 		err = errors.New("no ETag header in response - cannot fill version")
 		slog.Warn(fmt.Sprintf("Fill [%s] has %s", name, err.Error()))
 		return
 	}
+	remoteVersion = parse.ParseETagToVersion(remoteVersion)
 
 	lastSync := time.Now()
 	lastModified := resp.Header.Get("Last-Modified")
@@ -93,7 +94,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 
 	return api.Version{
 		Name:     name,
-		Version:  rv,
+		Version:  remoteVersion,
 		LastSync: lastSync,
 		Data:     data,
 	}, nil

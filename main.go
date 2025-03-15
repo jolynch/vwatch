@@ -14,27 +14,16 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jolynch/vwatch/internal"
 	"github.com/jolynch/vwatch/internal/api"
+	"github.com/jolynch/vwatch/internal/conf"
+	"github.com/jolynch/vwatch/internal/headers"
+	"github.com/jolynch/vwatch/internal/parse"
 	"github.com/jolynch/vwatch/internal/repl"
-	"github.com/jolynch/vwatch/internal/util"
 	"github.com/zeebo/xxh3"
 )
 
 var (
-	listen                = "127.0.0.1:8080"
-	replicateWith         = ""
-	replicateEvery        = 1 * time.Second
-	replicateResolveEvery = 10 * time.Second
-	fillAddr              = ""
-	fillPath              = "/version/{{.name}}"
-	fillExpiry            = 10 * time.Second
-	fillStrategy          = repl.FillWatch
-	blockFor              = 10 * time.Second
-	jitterFor             = 1 * time.Second
-	logLevel              = new(slog.LevelVar)
-	dataLimitBytes        = 4096
-
+	config    conf.Config
 	filler    *repl.Filler
 	gossiper  *repl.Gossiper
 	versions  sync.Map
@@ -79,8 +68,8 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		err     error
 	)
 
-	if filler != nil && fillStrategy == repl.FillWatch {
-		http.Error(w, "Replicating nodes cannot accept writes", http.StatusMethodNotAllowed)
+	if filler != nil && config.FillStrategy == repl.FillWatch {
+		http.Error(w, "Replicating nodes in FILL_WATCH cannot accept writes", http.StatusMethodNotAllowed)
 		return
 	}
 	// Name always comes from URL
@@ -117,7 +106,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	}
 
 	// Data comes from the first dataLimitBytes of the request body
-	buf := make([]byte, dataLimitBytes)
+	buf := make([]byte, config.DataLimitBytes)
 	n, err := io.ReadFull(req.Body, buf)
 	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
 		http.Error(w, "Error while reading body: "+err.Error(), http.StatusBadRequest)
@@ -131,14 +120,15 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	}
 
 	upsertVersion(name, version)
-	w.Header().Set(headers.ETag, version.Version)
+	// ETag must be enclosed in double quotes
+	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
 	w.WriteHeader(http.StatusNoContent)
 }
 
 func getVersion(w http.ResponseWriter, req *http.Request) {
 	var (
-		timeout time.Duration = blockFor
+		timeout time.Duration = config.BlockFor
 		err     error
 		version api.Version
 		name    string = req.PathValue("name")
@@ -155,7 +145,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	val, ok := versions.Load(name)
 	if !ok {
 		if filler != nil {
-			params := util.ParseName(name)
+			params := parse.ParseName(name)
 			version, err = filler.Fill(params, req.URL.Query())
 			if err == nil {
 				storeNewVersion(name, version)
@@ -172,11 +162,14 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	var previousVersion = ""
 	etag := req.Header.Get(headers.ETag)
 	if etag != "" {
-		previousVersion = etag
+		// Take the version from the header if present
+		previousVersion = parse.ParseETagToVersion(etag)
 	} else {
+		// Otherwise take the version from the URL parameter
 		v, ok := req.URL.Query()["version"]
 		if ok && len(v[0]) > 0 {
-			previousVersion = v[0]
+			previousVersion = parse.ParseETagToVersion(v[0])
+
 		}
 	}
 	if previousVersion != "" && previousVersion == version.Version {
@@ -204,14 +197,15 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
 		}
 		version = val.(api.Version)
-		if jitterFor.Milliseconds() > 0 {
-			jitterDuration := rand.Int63n(jitterFor.Milliseconds())
+		if config.JitterFor.Milliseconds() > 0 {
+			jitterDuration := rand.Int63n(config.JitterFor.Milliseconds())
 			w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
 			time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
 		}
 	}
 
-	w.Header().Set(headers.ETag, version.Version)
+	// ETag must be enclosed in double quotes
+	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
 	w.Header().Set(headers.ContentType, "application/octet-stream")
 	w.Write(version.Data)
@@ -267,86 +261,91 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 
 func setLogLevel(w http.ResponseWriter, req *http.Request) {
 	level, ok := req.URL.Query()["level"]
-	if ok {
-		slevel := slog.Level(0)
-		err := slevel.UnmarshalText([]byte(level[0]))
+	if ok && len(level[0]) > 0 {
+		logLevel, err := conf.LogLevel(level[0], slog.LevelInfo)
 		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid log level [%s]: %s", level[0], err.Error()), http.StatusBadRequest)
 			return
 		}
-		slog.SetLogLoggerLevel(slevel)
+		slog.SetLogLoggerLevel(logLevel)
 		io.WriteString(w, logLevel.Level().String())
-	} else {
-		http.Error(w, "/log requires a ?level=DEBUG param", http.StatusBadRequest)
+		return
 	}
+	http.Error(w, "/log requires a ?level=DEBUG param", http.StatusBadRequest)
 }
 
-var paths = `Paths
-GET /version/{repository}[:{tag}]?[version=last_seen]        -> Get latest version or block for new version
-PUT /version/{repository}[:{tag}]?[version=version <- <data> -> Set latest version, unblocking watches
-PUT /logging?level=DEBUG                                     -> Set log level
+var paths = `HTTP Server Paths:
+
+GET /version/{repository}[:{tag}]?[version=last_seen]         -> Get latest version or block for new version
+PUT /version/{repository}[:{tag}]?[version=version] <- <data> -> Set latest version, unblocking watches
+PUT /logging?level=DEBUG                                      -> Set log level
 
 Internal endpoints you should probably avoid unless you know what you are doing
 POST /replicate                            <- gob([]Version) -> Replicate state between leaders
 `
 
 func main() {
-	flag.StringVar(&listen, "listen", listen, "The address to listen on")
-	flag.StringVar(&replicateWith, "replicate-with", replicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
-	flag.DurationVar(&replicateEvery, "replicate-interval", replicateEvery, "How often to exchange state with peers")
-	flag.DurationVar(&replicateResolveEvery, "replicate-resolve-interval", replicateResolveEvery, "How often to resolve replicate-with to find peers")
+	config = conf.FromEnv()
 
-	flag.StringVar(&fillAddr, "fill-addr", fillAddr, "The address to fill from when a version is missing")
-	flag.StringVar(&fillPath, "fill-path", fillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
-	flag.DurationVar(&fillExpiry, "fill-expiry", fillExpiry, "Ask the upstream at least once every interval, for example 10s we would ask upstream every 10s")
-	flag.StringVar(&fillStrategy, "fill-strategy", fillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
-	flag.IntVar(&dataLimitBytes, "data-limit", dataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
-	flag.DurationVar(&blockFor, "block-for", blockFor, "The duration to block GETs by default for")
-	flag.DurationVar(&jitterFor, "jitter-for", jitterFor, "The duration to jitter blocking GETs by, should be less than block-for")
+	flag.StringVar(&config.Listen, "listen", config.Listen, "The address to listen on")
+	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
+	flag.DurationVar(&config.ReplicateEvery, "replicate-interval", config.ReplicateEvery, "How often to exchange state with peers")
+	flag.DurationVar(&config.ReplicateResolveEvery, "replicate-resolve-interval", config.ReplicateResolveEvery, "How often to resolve replicate-with to find peers")
+
+	flag.StringVar(&config.FillFrom, "fill-from", config.FillFrom, "The address to fill from when a version is missing")
+	flag.StringVar(&config.FillPath, "fill-path", config.FillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
+	flag.DurationVar(&config.FillExpiry, "fill-expiry", config.FillExpiry, "Ask the upstream at least once every interval, for example 10s we would ask upstream every 10s")
+	flag.StringVar(&config.FillStrategy, "fill-strategy", config.FillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
+	flag.Uint64Var(&config.DataLimitBytes, "data-limit", config.DataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
+	flag.DurationVar(&config.BlockFor, "block-for", config.BlockFor, "The duration to block GETs by default for")
+	flag.DurationVar(&config.JitterFor, "jitter-for", config.JitterFor, "The duration to jitter blocking GETs by, should be less than block-for")
 	flag.Parse()
 
-	badStrategy := slices.Contains(repl.ValidFillStrategies, fillStrategy)
+	badStrategy := slices.Contains(repl.ValidFillStrategies, config.FillStrategy)
 	if !badStrategy {
-		slog.Error(fmt.Sprintf("Bad -fill-strategy, passed %s but only support %v", fillStrategy, repl.ValidFillStrategies))
-		os.Exit(1)
+		slog.Error(fmt.Sprintf("Bad -fill-strategy, passed %s but only support %v", config.FillStrategy, repl.ValidFillStrategies))
+		os.Exit(2)
 	}
 
-	if fillAddr != "" {
-		slog.Info("Creating Filler to replicate from: " + fillAddr)
+	slog.Info("Configuration of Server:\n" + config.PrettyRepr())
+
+	if config.FillFrom != "" {
+		slog.Info("Creating Filler to replicate from: " + config.FillFrom)
 		client := &http.Client{
-			Timeout: blockFor * 2,
+			Timeout: config.BlockFor * 2,
 		}
 		monitor := &sync.Map{}
 		filler = &repl.Filler{
-			Addr:     fillAddr,
-			Path:     fillPath,
+			Addr:     config.FillFrom,
+			Path:     config.FillPath,
 			Client:   client,
 			Monitor:  monitor,
 			Channel:  make(chan map[string]string, 2),
-			FillBody: fillStrategy == repl.FillWatch,
+			FillBody: config.FillStrategy == repl.FillWatch,
 		}
-		go filler.Watch(&versions, fillExpiry, storeNewVersion, fillStrategy)
+		go filler.Watch(&versions, config.FillExpiry, storeNewVersion, config.FillStrategy)
 	}
-	if replicateWith != "" {
-		slog.Info("Creating Gossiper to replicate with: " + replicateWith)
-		addrs := strings.Split(replicateWith, ",")
+	if config.ReplicateWith != "" {
+		slog.Info("Creating Gossiper to replicate with: " + config.ReplicateWith)
+		addrs := strings.Split(config.ReplicateWith, ",")
 		client := &http.Client{
-			Timeout: blockFor,
+			Timeout: config.BlockFor,
 		}
 		gossiper = &repl.Gossiper{
 			Addrs:      addrs,
 			Client:     client,
 			LocalState: &versions,
 		}
-		go gossiper.Gossip(upsertVersion, replicateEvery, replicateResolveEvery)
+		go gossiper.Gossip(upsertVersion, config.ReplicateEvery, config.ReplicateResolveEvery)
 	}
 	http.HandleFunc("PUT /version/{name...}", putVersion)
 	http.HandleFunc("GET /version/{name...}", getVersion)
 	http.HandleFunc("PUT /logging", setLogLevel)
 	http.HandleFunc("POST /replicate", replicate)
 
-	slog.Info(fmt.Sprintf("Listening at %s", listen))
+	slog.Info(fmt.Sprintf("Listening at %s", config.Listen))
 	slog.Info(paths)
-	err := http.ListenAndServe(listen, nil)
+	err := http.ListenAndServe(config.Listen, nil)
 	if err != nil {
 		slog.Error("Failed to bind, is another server listening at this address?")
 		os.Exit(1)

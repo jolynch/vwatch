@@ -1,4 +1,4 @@
-package util
+package parse
 
 import (
 	"bytes"
@@ -8,6 +8,20 @@ import (
 	"text/template"
 )
 
+func ParseETagToVersion(etag string) string {
+	if len(etag) == 0 {
+		return etag
+	}
+	// Strip the double quotes in the etag if present
+	if etag[0] == '"' {
+		etag = etag[1:]
+	}
+	if len(etag) > 0 && etag[len(etag)-1] == '"' {
+		etag = etag[:len(etag)-1]
+	}
+
+	return etag
+}
 func ParseName(name string) map[string]string {
 	repository := name
 	tag := ""
