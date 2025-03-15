@@ -5,10 +5,12 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"net"
 	"net/http"
 	"net/url"
 	"reflect"
+	"slices"
 	"sync"
 	"time"
 
@@ -56,6 +58,7 @@ func (gossiper *Gossiper) findPeers() {
 			}
 			// Always keep last peer around
 			if len(peers) > 0 {
+				slices.Sort(peers)
 				gossiper.PeerMutex.Lock()
 				if !reflect.DeepEqual(peers, gossiper.Peers) {
 					slog.Info(fmt.Sprintf("Gossiper found %d peers %+v", len(peers), peers))
@@ -72,15 +75,18 @@ func (gossiper *Gossiper) findPeers() {
 }
 
 func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time.Duration) {
-	var i int64 = 0
 	for {
 		gossiper.PeerMutex.RLock()
-		if len(gossiper.Peers) > 0 {
-			peer := gossiper.Peers[i%int64(len(gossiper.Peers))]
-			gossiper.PeerMutex.RUnlock()
+		peersCopy := make([]string, len(gossiper.Peers))
+		_ = copy(peersCopy, gossiper.Peers)
+		gossiper.PeerMutex.RUnlock()
 
+		// So we exchange state with random nodes, bringing convergeance down to worst case 1s * numPeers
+		rand.Shuffle(len(peersCopy), func(i, j int) { peersCopy[i], peersCopy[j] = peersCopy[j], peersCopy[i] })
+		for _, peer := range peersCopy {
 			slog.Debug("Gossip with [" + peer + "]")
 			var myVersions []api.Version
+			// Never send data to keep Merkle tree as small as possible
 			gossiper.LocalState.Range(func(key, value any) bool {
 				name := value.(api.Version).Name
 				version := value.(api.Version).Version
@@ -104,12 +110,11 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 			} else {
 				slog.Warn("Gossip failed with : " + err.Error())
 			}
-		} else {
-			gossiper.PeerMutex.RUnlock()
+			time.Sleep(replicateInterval)
 		}
-
-		time.Sleep(replicateInterval)
-		i++
+		if len(peersCopy) == 0 {
+			time.Sleep(replicateInterval)
+		}
 	}
 }
 

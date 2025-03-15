@@ -174,6 +174,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	}
 	if previousVersion != "" && previousVersion == version.Version {
 		// Long poll
+		start := time.Now()
 		watchLock.Lock()
 		watcher, ok := watchers[name]
 		if !ok {
@@ -202,12 +203,15 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
 			time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
 		}
+		end := time.Now()
+		w.Header().Set("Blocked-For", end.Sub(start).Round(time.Millisecond).String())
 	}
 
 	// ETag must be enclosed in double quotes
 	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
 	w.Header().Set(headers.ContentType, "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
 	w.Write(version.Data)
 }
 
@@ -236,26 +240,38 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 	}
 	var remoteKeys map[string]bool = make(map[string]bool)
 	var deltas []api.Version
+	// Limit single response to 1MiB at a time
+	var budgetBytes = 1 * 1024 * 1024
 
 	for _, version := range remoteVersions {
 		remoteKeys[version.Name] = true
 		pv, ok := versions.Load(version.Name)
 		if ok {
-			prev := pv.(api.Version).LastSync.UnixNano()
-			if prev > version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
-				deltas = append(deltas, pv.(api.Version))
+			prevVersion := pv.(api.Version)
+			prev := prevVersion.LastSync.UnixNano()
+			if prev > version.LastSync.UnixNano() && prevVersion.Version != version.Version {
+				deltas = append(deltas, prevVersion)
+				budgetBytes -= prevVersion.SizeBytes()
 			}
+		}
+		if budgetBytes < 0 {
+			break
 		}
 	}
 	versions.Range(func(key, value any) bool {
+		if budgetBytes < 0 {
+			return false
+		}
 		_, seen := remoteKeys[key.(string)]
 		if !seen {
 			deltas = append(deltas, value.(api.Version))
+			budgetBytes -= value.(api.Version).SizeBytes()
 		}
-		return true
+		return budgetBytes >= 0
 	})
 
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.WriteHeader(http.StatusOK)
 	gob.NewEncoder(w).Encode(deltas)
 }
 
