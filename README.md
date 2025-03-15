@@ -70,8 +70,8 @@ The blocking read now unblocks with the new version
 < HTTP/1.1 200 OK
 < Content-Type: application/octet-stream
 < Etag: 9be3e0a3
-< Jittered: 689 ms
 < Last-Modified: Thu, 13 Mar 2025 03:52:17 GMT
+< Server-Timing: jitter;dur=634ms, watch;dur=6.055s
 < Date: Thu, 13 Mar 2025 03:52:18 GMT
 < Content-Length: 4
 <
@@ -79,7 +79,7 @@ The blocking read now unblocks with the new version
 1234
 ```
 
-Note the new Etag, Last-Modified and Jittered header, as well as the new value.
+Note the new Etag, Last-Modified and Server-Timing header, as well as the new value.
 
 ## Multi Process Mode
 You can have vwatch either `fill` from an upstream docker registry or vwatch process (allowing you to create read replicas),

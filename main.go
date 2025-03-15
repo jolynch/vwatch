@@ -131,7 +131,9 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 		timeout time.Duration = config.BlockFor
 		err     error
 		version api.Version
-		name    string = req.PathValue("name")
+		name    string    = req.PathValue("name")
+		start   time.Time = time.Now()
+		timings []string
 	)
 
 	t, ok := req.URL.Query()["timeout"]
@@ -174,7 +176,6 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	}
 	if previousVersion != "" && previousVersion == version.Version {
 		// Long poll
-		start := time.Now()
 		watchLock.Lock()
 		watcher, ok := watchers[name]
 		if !ok {
@@ -199,18 +200,20 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 		}
 		version = val.(api.Version)
 		if config.JitterFor.Milliseconds() > 0 {
-			jitterDuration := rand.Int63n(config.JitterFor.Milliseconds())
-			w.Header().Set("Jittered", fmt.Sprintf("%d ms", jitterDuration))
-			time.Sleep(time.Duration(jitterDuration) * time.Millisecond)
+			jitterDuration := time.Duration(rand.Int63n(config.JitterFor.Milliseconds())) * time.Millisecond
+			timings = append(timings, fmt.Sprintf("jitter;dur=%s", jitterDuration.Round(time.Millisecond).String()))
+			time.Sleep(jitterDuration)
 		}
-		end := time.Now()
-		w.Header().Set("Blocked-For", end.Sub(start).Round(time.Millisecond).String())
 	}
+
+	end := time.Now()
+	timings = append(timings, fmt.Sprintf("watch;dur=%s", end.Sub(start).Round(time.Millisecond).String()))
 
 	// ETag must be enclosed in double quotes
 	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
 	w.Header().Set(headers.ContentType, "application/octet-stream")
+	w.Header().Add(headers.ServerTiming, strings.Join(timings, ", "))
 	w.WriteHeader(http.StatusOK)
 	w.Write(version.Data)
 }
