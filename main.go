@@ -240,8 +240,8 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 	}
 	var remoteKeys map[string]bool = make(map[string]bool)
 	var deltas []api.Version
-	// Limit single response to 1MiB at a time
-	var budgetBytes = 1 * 1024 * 1024
+	// Limit single response to 1MiB at a time (by default)
+	var budgetBytes = int(config.ReplicateLimitBytes)
 
 	for _, version := range remoteVersions {
 		remoteKeys[version.Name] = true

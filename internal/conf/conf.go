@@ -17,6 +17,7 @@ type Config struct {
 	ReplicateWith         string        `json:"replicate-with"`
 	ReplicateEvery        time.Duration `json:"replicate-every"`
 	ReplicateResolveEvery time.Duration `json:"replicate-resolve-every"`
+	ReplicateLimitBytes   uint64        `json:"replicate-limit-bytes"`
 	FillFrom              string        `json:"fill-from"`
 	FillPath              string        `json:"fill-path"`
 	FillExpiry            time.Duration `json:"fill-expiry"`
@@ -66,14 +67,17 @@ func FromEnv() Config {
 		ReplicateWith:         EnvString("VWATCH_REPLICATE_WITH", ""),
 		ReplicateEvery:        EnvDuration("VWATCH_REPLICATE_EVERY", 1*time.Second),
 		ReplicateResolveEvery: EnvDuration("VWATCH_REPLICATE_RESOLVE_EVERY", 10*time.Second),
-		FillFrom:              EnvString("VWATCH_FILL_FROM", ""),
-		FillPath:              EnvString("VWATCH_FILL_PATH", "/version/{{.name}}"),
-		FillExpiry:            EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
-		FillStrategy:          EnvString("VWATCH_FILL_STRATEGY", repl.FillWatch),
-		BlockFor:              EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
-		JitterFor:             EnvDuration("VWATCH_JITTER_FOR", 1*time.Second),
-		LogLevel:              EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
-		DataLimitBytes:        EnvUint("VWATCH_DATA_LIMIT_BYTES", 4096),
+		// Default replication limit is 1MiB at a time
+		ReplicateLimitBytes: EnvUint("VWATCH_REPLICATE_LIMIT_BYTES", 1*1024*1024),
+		FillFrom:            EnvString("VWATCH_FILL_FROM", ""),
+		FillPath:            EnvString("VWATCH_FILL_PATH", "/version/{{.name}}"),
+		FillExpiry:          EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
+		FillStrategy:        EnvString("VWATCH_FILL_STRATEGY", repl.FillWatch),
+		BlockFor:            EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
+		JitterFor:           EnvDuration("VWATCH_JITTER_FOR", 1*time.Second),
+		LogLevel:            EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
+		// Default limit on data size is 4KiB, not a database!
+		DataLimitBytes: EnvUint("VWATCH_DATA_LIMIT_BYTES", 4*1024),
 	}
 }
 
