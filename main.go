@@ -23,11 +23,12 @@ import (
 )
 
 var (
-	config   conf.Config
-	filler   *repl.Filler
-	gossiper *repl.Gossiper
-	versions sync.Map
-	watchers sync.Map
+	config      conf.Config
+	filler      *repl.Filler
+	gossiper    *repl.Gossiper
+	versionLock sync.Mutex
+	versions    sync.Map
+	watchers    sync.Map
 )
 
 type Watcher struct {
@@ -38,40 +39,63 @@ func makeWatcher() Watcher {
 	return Watcher{Signal: make(chan string)}
 }
 
-type UniqueVersion struct {
-	NameHi    uint64
-	NameLo    uint64
-	VersionHi uint64
-	VersionLo uint64
+func loadOrStoreWatcher(name, version string) Watcher {
+	v, _ := loadOrStoreWatcherMap(name).LoadOrStore(version, makeWatcher())
+	return v.(Watcher)
 }
 
-func makeUniqueVersion(name string, version string) UniqueVersion {
-	n := xxh3.Hash128([]byte(name))
-	v := xxh3.Hash128([]byte(version))
-	return UniqueVersion{
-		NameHi:    n.Hi,
-		NameLo:    n.Lo,
-		VersionHi: v.Hi,
-		VersionLo: v.Lo,
-	}
-}
-
-func storeNewVersion(name string, version api.Version) bool {
-	w := makeUniqueVersion(name, version.Version)
-	watchers.LoadOrStore(w, makeWatcher())
-	versions.Store(name, version)
-
-	watchers.Range(func(key, value any) bool {
-		k := key.(UniqueVersion)
-		if k.NameHi == w.NameHi && k.NameLo == w.NameLo && !(k.VersionHi == w.VersionHi && k.VersionLo == w.VersionLo) {
-			watcher := value.(Watcher)
-			close(watcher.Signal)
-			// Is this safe?
-			watchers.Delete(key)
+func loadOrStoreWatcherMap(name string) *sync.Map {
+	versionMap, ok := watchers.Load(name)
+	if ok {
+		versionMap = versionMap.(*sync.Map)
+	} else {
+		versionMap = &sync.Map{}
+		v, loaded := watchers.LoadOrStore(name, versionMap)
+		if loaded {
+			versionMap = v.(*sync.Map)
 		}
-		return true
-	})
-	return true
+	}
+	return versionMap.(*sync.Map)
+}
+
+func storeNewVersion(name string, version api.Version) (stored bool) {
+	// Up until now we have done optimistic concurrency control on versions, when we actually go
+	// to store the version and wake all watchers on versions not equal to that version, we need
+	// to lock for the Compare And Swap operation. Otherwise we could be storing new versions
+	// which are then being waited on before we can clean up properly.
+	versionLock.Lock()
+	defer versionLock.Unlock()
+
+	pv, ok := versions.Load(name)
+	if ok {
+		prev := pv.(api.Version).LastSync.UnixNano()
+		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+			versions.Store(name, version)
+		} else {
+			version = pv.(api.Version)
+			stored = false
+		}
+	} else {
+		versions.Store(name, version)
+	}
+
+	// Only wake watchers if they exist, we may receive writes for names
+	// that are not watched at all.
+	pv, ok = watchers.Load(name)
+	if ok {
+		watchMap := pv.(*sync.Map)
+		latestVersion := version.Version
+		// Wake any reads waiting on versions other than this latest version
+		watchMap.Range(func(key, value any) bool {
+			if latestVersion != key.(string) {
+				watcher := value.(Watcher)
+				close(watcher.Signal)
+				watchMap.Delete(key)
+			}
+			return true
+		})
+	}
+	return stored
 }
 
 func putVersion(w http.ResponseWriter, req *http.Request) {
@@ -163,7 +187,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			params := parse.ParseName(name)
 			version, err = filler.Fill(params, req.URL.Query())
 			if err == nil {
-				storeNewVersion(name, version)
+				upsertVersion(name, version)
 				val, ok = versions.Load(name)
 			}
 		}
@@ -188,11 +212,11 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	if previousVersion != "" && previousVersion == version.Version {
-		// Long poll
-		watcher, _ := watchers.LoadOrStore(makeUniqueVersion(name, version.Version), makeWatcher())
+		// Long poll on this version
+		watcher := loadOrStoreWatcher(name, version.Version)
 
 		select {
-		case <-watcher.(Watcher).Signal:
+		case <-watcher.Signal:
 			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to signal", name))
 		case <-time.After(timeout):
 			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
@@ -227,13 +251,11 @@ func upsertVersion(name string, version api.Version) bool {
 	if ok {
 		prev := pv.(api.Version).LastSync.UnixNano()
 		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
-			storeNewVersion(name, version)
-			return true
+			return storeNewVersion(name, version)
 		}
 		return false
 	} else {
-		storeNewVersion(name, version)
-		return true
+		return storeNewVersion(name, version)
 	}
 }
 
