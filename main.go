@@ -23,41 +23,54 @@ import (
 )
 
 var (
-	config    conf.Config
-	filler    *repl.Filler
-	gossiper  *repl.Gossiper
-	versions  sync.Map
-	watchLock sync.Mutex
-	watchers  map[string]Watcher = make(map[string]Watcher)
+	config   conf.Config
+	filler   *repl.Filler
+	gossiper *repl.Gossiper
+	versions sync.Map
+	watchers sync.Map
 )
 
 type Watcher struct {
-	WatchGroup *sync.WaitGroup
-	Signal     chan string
+	Signal chan string
 }
 
 func makeWatcher() Watcher {
-	var (
-		wg sync.WaitGroup
-		ch = make(chan string)
-	)
-	return Watcher{WatchGroup: &wg, Signal: ch}
+	return Watcher{Signal: make(chan string)}
+}
+
+type UniqueVersion struct {
+	NameHi    uint64
+	NameLo    uint64
+	VersionHi uint64
+	VersionLo uint64
+}
+
+func makeUniqueVersion(name string, version string) UniqueVersion {
+	n := xxh3.Hash128([]byte(name))
+	v := xxh3.Hash128([]byte(version))
+	return UniqueVersion{
+		NameHi:    n.Hi,
+		NameLo:    n.Lo,
+		VersionHi: v.Hi,
+		VersionLo: v.Lo,
+	}
 }
 
 func storeNewVersion(name string, version api.Version) bool {
+	w := makeUniqueVersion(name, version.Version)
+	watchers.LoadOrStore(w, makeWatcher())
 	versions.Store(name, version)
 
-	watchLock.Lock()
-	defer watchLock.Unlock()
-
-	watcher, ok := watchers[name]
-	if ok {
-		// Safe to delete because we hold the watchLock
-		delete(watchers, name)
-		// Broadcast the wakeup by closing
-		close(watcher.Signal)
-		watcher.WatchGroup.Wait()
-	}
+	watchers.Range(func(key, value any) bool {
+		k := key.(UniqueVersion)
+		if k.NameHi == w.NameHi && k.NameLo == w.NameLo && !(k.VersionHi == w.VersionHi && k.VersionLo == w.VersionLo) {
+			watcher := value.(Watcher)
+			close(watcher.Signal)
+			// Is this safe?
+			watchers.Delete(key)
+		}
+		return true
+	})
 	return true
 }
 
@@ -176,23 +189,14 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	}
 	if previousVersion != "" && previousVersion == version.Version {
 		// Long poll
-		watchLock.Lock()
-		watcher, ok := watchers[name]
-		if !ok {
-			watcher = makeWatcher()
-			watchers[name] = watcher
-		}
-		watcher.WatchGroup.Add(1)
-		watchLock.Unlock()
+		watcher, _ := watchers.LoadOrStore(makeUniqueVersion(name, version.Version), makeWatcher())
 
 		select {
-		case <-watcher.Signal:
+		case <-watcher.(Watcher).Signal:
 			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to signal", name))
 		case <-time.After(timeout):
 			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
 		}
-		// The update is holding a lock while waiting for this, so we need to release it asap.
-		watcher.WatchGroup.Done()
 
 		val, ok = versions.Load(name)
 		if !ok {
