@@ -22,9 +22,10 @@ func ParseETagToVersion(etag string) string {
 
 	return etag
 }
+
 func ParseName(name string) map[string]string {
 	repository := name
-	tag := ""
+	tag := "latest"
 	if strings.Contains(name, ":") {
 		idx := strings.LastIndex(name, ":")
 		repository = name[:idx]
@@ -37,17 +38,17 @@ func ParseName(name string) map[string]string {
 	}
 }
 
-func ExpandPattern(pattern string, params map[string]string) string {
-	tmpl, err := template.New("path").Parse(pattern)
+func ExpandPattern(pattern string, params map[string]string) (res string, err error) {
+	tmpl, err := template.New("path").Option("missingkey=error").Parse(pattern)
 	if err != nil {
 		slog.Error(fmt.Sprintf("Invalid template [%s]: %s", pattern, err.Error()))
-		return pattern
+		return
 	}
 	var buf bytes.Buffer
 	err = tmpl.Execute(&buf, params)
 	if err != nil {
 		slog.Error(fmt.Sprintf("Failed to template [%s]: %s", pattern, err.Error()))
-		return pattern
+		return
 	}
-	return buf.String()
+	return buf.String(), nil
 }

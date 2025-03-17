@@ -28,7 +28,8 @@ var (
 	gossiper    *repl.Gossiper
 	versionLock sync.Mutex
 	versions    sync.Map
-	watchers    sync.Map
+	// Two level map of name -> version -> Watcher
+	watchers sync.Map
 )
 
 type Watcher struct {
@@ -66,8 +67,17 @@ func storeNewVersion(name string, version api.Version) (stored bool) {
 	versionLock.Lock()
 	defer versionLock.Unlock()
 
-	pv, ok := versions.Load(name)
-	if ok {
+	stored = true
+	pv, hasVersion := versions.Load(name)
+	pw, hasWatch := watchers.Load(name)
+
+	// When acting as a cache, we have nothing to do if there has never been a
+	// watch for this key
+	if config.FillStrategy == repl.FillCache && !hasWatch {
+		return
+	}
+
+	if hasVersion {
 		prev := pv.(api.Version).LastSync.UnixNano()
 		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
 			versions.Store(name, version)
@@ -81,9 +91,8 @@ func storeNewVersion(name string, version api.Version) (stored bool) {
 
 	// Only wake watchers if they exist, we may receive writes for names
 	// that are not watched at all.
-	pv, ok = watchers.Load(name)
-	if ok {
-		watchMap := pv.(*sync.Map)
+	if hasWatch {
+		watchMap := pw.(*sync.Map)
 		latestVersion := version.Version
 		// Wake any reads waiting on versions other than this latest version
 		watchMap.Range(func(key, value any) bool {
@@ -108,6 +117,9 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	if filler != nil && config.FillStrategy == repl.FillWatch {
 		http.Error(w, "Replicating nodes in FILL_WATCH cannot accept writes", http.StatusMethodNotAllowed)
 		return
+	}
+	if name == "" {
+		http.Error(w, "Must pass a non empty name", http.StatusBadRequest)
 	}
 	// Name always comes from URL
 	version.Name = name
@@ -355,33 +367,10 @@ func main() {
 	slog.Info("Configuration of Server:\n" + config.PrettyRepr())
 
 	if config.FillFrom != "" {
-		slog.Info("Creating Filler to replicate from: " + config.FillFrom)
-		client := &http.Client{
-			Timeout: config.BlockFor * 2,
-		}
-		monitor := &sync.Map{}
-		filler = &repl.Filler{
-			Addr:     config.FillFrom,
-			Path:     config.FillPath,
-			Client:   client,
-			Monitor:  monitor,
-			Channel:  make(chan map[string]string, 2),
-			FillBody: config.FillStrategy == repl.FillWatch,
-		}
-		go filler.Watch(&versions, config.FillExpiry, storeNewVersion, config.FillStrategy)
+		setupFill()
 	}
 	if config.ReplicateWith != "" {
-		slog.Info("Creating Gossiper to replicate with: " + config.ReplicateWith)
-		addrs := strings.Split(config.ReplicateWith, ",")
-		client := &http.Client{
-			Timeout: config.BlockFor,
-		}
-		gossiper = &repl.Gossiper{
-			Addrs:      addrs,
-			Client:     client,
-			LocalState: &versions,
-		}
-		go gossiper.Gossip(upsertVersion, config.ReplicateEvery, config.ReplicateResolveEvery)
+		setupReplication()
 	}
 	http.HandleFunc("PUT /version/{name...}", putVersion)
 	http.HandleFunc("GET /version/{name...}", getVersion)
@@ -397,4 +386,35 @@ func main() {
 	} else {
 		slog.Info("All Done!")
 	}
+}
+
+func setupReplication() {
+	slog.Info("Creating Gossiper to replicate with: " + config.ReplicateWith)
+	addrs := strings.Split(config.ReplicateWith, ",")
+	client := &http.Client{
+		Timeout: config.BlockFor,
+	}
+	gossiper = &repl.Gossiper{
+		Addrs:      addrs,
+		Client:     client,
+		LocalState: &versions,
+	}
+	go gossiper.Gossip(upsertVersion, config.ReplicateEvery, config.ReplicateResolveEvery)
+}
+
+func setupFill() {
+	slog.Info("Creating Filler to replicate from: " + config.FillFrom)
+	client := &http.Client{
+		Timeout: config.BlockFor * 2,
+	}
+	monitor := &sync.Map{}
+	filler = &repl.Filler{
+		Addr:     config.FillFrom,
+		Path:     config.FillPath,
+		Client:   client,
+		Monitor:  monitor,
+		Channel:  make(chan map[string]string, 2),
+		FillBody: config.FillStrategy == repl.FillWatch,
+	}
+	go filler.Watch(&versions, config.FillExpiry, storeNewVersion, config.FillStrategy)
 }

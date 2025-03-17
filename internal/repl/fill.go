@@ -39,7 +39,10 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		return
 	}
 	name := nameParams["name"]
-	urlPath := parse.ExpandPattern(filler.Path, nameParams)
+	urlPath, err := parse.ExpandPattern(filler.Path, nameParams)
+	if err != nil {
+		return
+	}
 	slog.Debug(fmt.Sprintf("Fill [%s] expanded url to: %s", name, urlPath))
 
 	filled, err := url.JoinPath(filler.Addr, urlPath)
