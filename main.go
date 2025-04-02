@@ -197,11 +197,26 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		if filler != nil {
 			params := parse.ParseName(name)
-			version, err = filler.Fill(params, req.URL.Query())
-			if err == nil {
-				upsertVersion(name, version)
-				val, ok = versions.Load(name)
+			resp := make(chan api.Version, 1)
+			// Need to respect timeout when making fill calls
+			go func(response chan api.Version) {
+				version, err := filler.Fill(params, req.URL.Query())
+				if err == nil {
+					response <- version
+				}
+				close(response)
+			}(resp)
+
+			select {
+			case version, ok = <-resp:
+				slog.Debug(fmt.Sprintf("Unblocking Fill GET[%s] due to result", name))
+				if ok {
+					upsertVersion(name, version)
+				}
+			case <-time.After(timeout):
+				slog.Debug(fmt.Sprintf("Unblocking Fill GET[%s] due to %s timeout", name, timeout))
 			}
+			val, ok = versions.Load(name)
 		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -284,6 +299,13 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 	// Limit single response to 1MiB at a time (by default)
 	var budgetBytes = int(config.ReplicateLimitBytes)
 
+	// Just ensure we make some progress even if there are many many deltas
+	rand.Shuffle(
+		len(remoteVersions),
+		func(i, j int) {
+			remoteVersions[i], remoteVersions[j] = remoteVersions[j], remoteVersions[i]
+		})
+
 	for _, version := range remoteVersions {
 		remoteKeys[version.Name] = true
 		pv, ok := versions.Load(version.Name)
@@ -331,21 +353,22 @@ func setLogLevel(w http.ResponseWriter, req *http.Request) {
 	http.Error(w, "/log requires a ?level=DEBUG param", http.StatusBadRequest)
 }
 
-var paths = `HTTP Server Paths:
-
-GET /version/{repository}[:{tag}]?[version=last_seen]         -> Get latest version or block for new version
-PUT /version/{repository}[:{tag}]?[version=version] <- <data> -> Set latest version, unblocking watches
-PUT /logging?level=DEBUG                                      -> Set log level
-
-Internal endpoints you should probably avoid unless you know what you are doing
-POST /replicate                            <- gob([]Version) -> Replicate state between leaders
+var paths = `Client HTTP Server Paths:
+GET /v1/version/{repository}[:{tag}]?[version=last_seen]         -> Get latest version or block for new version
+PUT /v1/version/{repository}[:{tag}]?[version=version] <- <data> -> Set latest version, unblocking watches
+`
+var serverPaths = `Server HTTP Server Paths:
+GET 
+PUT /v1/logging?level=DEBUG                                     -> Set log level
+POST /v1/replicate                            <- gob([]Version) -> Replicate state between leaders
 `
 
 func main() {
 	config = conf.FromEnv()
 
-	flag.StringVar(&config.Listen, "listen", config.Listen, "The address to listen on")
-	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
+	flag.StringVar(&config.ListenClient, "listen-client", config.ListenClient, "The address to listen on for clients")
+	flag.StringVar(&config.ListenServer, "listen-server", config.ListenServer, "The address to listen on for server traffic (replication)")
+	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips. This should be their server-listen address!")
 	flag.DurationVar(&config.ReplicateEvery, "replicate-interval", config.ReplicateEvery, "How often to exchange state with peers")
 	flag.DurationVar(&config.ReplicateResolveEvery, "replicate-resolve-interval", config.ReplicateResolveEvery, "How often to resolve replicate-with to find peers")
 
@@ -366,22 +389,42 @@ func main() {
 
 	slog.Info("Configuration of Server:\n" + config.PrettyRepr())
 
+	go listenForClients()
 	if config.FillFrom != "" {
 		setupFill()
 	}
 	if config.ReplicateWith != "" {
 		setupReplication()
+		go listenForServers()
 	}
-	http.HandleFunc("PUT /version/{name...}", putVersion)
-	http.HandleFunc("GET /version/{name...}", getVersion)
-	http.HandleFunc("PUT /logging", setLogLevel)
-	http.HandleFunc("POST /replicate", replicate)
 
-	slog.Info(fmt.Sprintf("Listening at %s", config.Listen))
+	select {}
+}
+
+func listenForClients() {
+	// External "Client" endpoints
+	http.HandleFunc("PUT /v1/version/{name...}", putVersion)
+	http.HandleFunc("GET /v1/version/{name...}", getVersion)
+	slog.Info(fmt.Sprintf("Listening for Clients at %s", config.ListenClient))
 	slog.Info(paths)
-	err := http.ListenAndServe(config.Listen, nil)
+	err := http.ListenAndServe(config.ListenClient, nil)
 	if err != nil {
-		slog.Error("Failed to bind, is another server listening at this address?")
+		slog.Error(fmt.Sprintf("Failed to bind %s, is another server already listening?", config.ListenClient))
+		os.Exit(1)
+	} else {
+		slog.Info("All Done!")
+	}
+}
+
+func listenForServers() {
+	// Internal "Server" endpoints
+	http.HandleFunc("PUT /v1/logging", setLogLevel)
+	http.HandleFunc("POST /v1/replicate", replicate)
+	slog.Info(fmt.Sprintf("Listening for Clients at %s", config.ListenServer))
+	slog.Info(serverPaths)
+	err := http.ListenAndServe(config.ListenServer, nil)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Failed to bind %s, is another server already listening?", config.ListenServer))
 		os.Exit(1)
 	} else {
 		slog.Info("All Done!")

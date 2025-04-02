@@ -48,7 +48,7 @@ func (gossiper *Gossiper) findPeers() {
 					newURL := url.URL{
 						Scheme: u.Scheme,
 						Host:   newHost,
-						Path:   "/replicate",
+						Path:   "/v1/replicate",
 					}
 
 					peers = append(peers, newURL.String())
@@ -81,7 +81,7 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 		_ = copy(peersCopy, gossiper.Peers)
 		gossiper.PeerMutex.RUnlock()
 
-		// So we exchange state with random nodes, bringing convergeance down to worst case 1s * numPeers
+		// So we exchange state with random nodes, bringing convergence down to worst case 1s * numPeers
 		rand.Shuffle(len(peersCopy), func(i, j int) { peersCopy[i], peersCopy[j] = peersCopy[j], peersCopy[i] })
 		for _, peer := range peersCopy {
 			slog.Debug("Gossip with [" + peer + "]")
