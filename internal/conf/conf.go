@@ -13,7 +13,8 @@ import (
 )
 
 type Config struct {
-	Listen                string        `json:"listen"`
+	ListenClient          string        `json:"client-listen"`
+	ListenServer          string        `json:"server-listen"`
 	ReplicateWith         string        `json:"replicate-with"`
 	ReplicateEvery        time.Duration `json:"replicate-every"`
 	ReplicateResolveEvery time.Duration `json:"replicate-resolve-every"`
@@ -23,7 +24,7 @@ type Config struct {
 	FillExpiry            time.Duration `json:"fill-expiry"`
 	FillStrategy          string        `json:"fill-strategy"`
 	BlockFor              time.Duration `json:"block-for"`
-	JitterFor             time.Duration `json:"jitter-for"`
+	JitterPerWatch        time.Duration `json:"jitter-per-watch"`
 	LogLevel              slog.Level    `json:"log-level"`
 	DataLimitBytes        uint64        `json:"data-limit-bytes"`
 }
@@ -63,21 +64,20 @@ func repr(val any) (result string) {
 
 func FromEnv() Config {
 	return Config{
-		Listen:                EnvString("VWATCH_LISTEN", "127.0.0.1:8080"),
+		ListenClient:          EnvString("VWATCH_LISTEN_CLIENT", "127.0.0.1:8080"),
+		ListenServer:          EnvString("VWATCH_LISTEN_SERVER", "127.0.0.1:8008"),
 		ReplicateWith:         EnvString("VWATCH_REPLICATE_WITH", ""),
 		ReplicateEvery:        EnvDuration("VWATCH_REPLICATE_EVERY", 1*time.Second),
 		ReplicateResolveEvery: EnvDuration("VWATCH_REPLICATE_RESOLVE_EVERY", 10*time.Second),
-		// Default replication limit is 1MiB at a time
-		ReplicateLimitBytes: EnvUint("VWATCH_REPLICATE_LIMIT_BYTES", 1*1024*1024),
-		FillFrom:            EnvString("VWATCH_FILL_FROM", ""),
-		FillPath:            EnvString("VWATCH_FILL_PATH", "/version/{{.name}}"),
-		FillExpiry:          EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
-		FillStrategy:        EnvString("VWATCH_FILL_STRATEGY", repl.FillWatch),
-		BlockFor:            EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
-		JitterFor:           EnvDuration("VWATCH_JITTER_FOR", 1*time.Second),
-		LogLevel:            EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
-		// Default limit on data size is 4KiB, not a database!
-		DataLimitBytes: EnvUint("VWATCH_DATA_LIMIT_BYTES", 4*1024),
+		ReplicateLimitBytes:   EnvUint("VWATCH_REPLICATE_LIMIT_BYTES", 1*1024*1024),
+		FillFrom:              EnvString("VWATCH_FILL_FROM", ""),
+		FillPath:              EnvString("VWATCH_FILL_PATH", "/v1/versions/{{.name}}"),
+		FillExpiry:            EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
+		FillStrategy:          EnvString("VWATCH_FILL_STRATEGY", repl.FillWatch),
+		BlockFor:              EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
+		JitterPerWatch:         EnvDuration("VWATCH_JITTER_PER_WATCH", 1*time.Millisecond),
+		LogLevel:              EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
+		DataLimitBytes:        EnvUint("VWATCH_DATA_LIMIT_BYTES", 4*1024),
 	}
 }
 

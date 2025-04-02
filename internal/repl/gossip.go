@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"reflect"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -48,7 +49,7 @@ func (gossiper *Gossiper) findPeers() {
 					newURL := url.URL{
 						Scheme: u.Scheme,
 						Host:   newHost,
-						Path:   "/replicate",
+						Path:   "/v1/versions",
 					}
 
 					peers = append(peers, newURL.String())
@@ -81,7 +82,7 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 		_ = copy(peersCopy, gossiper.Peers)
 		gossiper.PeerMutex.RUnlock()
 
-		// So we exchange state with random nodes, bringing convergeance down to worst case 1s * numPeers
+		// So we exchange state with random nodes, bringing convergence down to worst case 1s * numPeers
 		rand.Shuffle(len(peersCopy), func(i, j int) { peersCopy[i], peersCopy[j] = peersCopy[j], peersCopy[i] })
 		for _, peer := range peersCopy {
 			slog.Debug("Gossip with [" + peer + "]")
@@ -105,7 +106,21 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 					upsertVersion(v.Name, v)
 				}
 				if len(theirVersions) > 0 {
-					slog.Info(fmt.Sprintf("Peer sent %d new versions!", len(theirVersions)))
+					if len(theirVersions) < 5 {
+						var detail []string
+						for _, version := range theirVersions {
+							detail = append(detail, version.Format(32))
+						}
+						slog.Info(fmt.Sprintf(
+							"Peer sent %d new versions\n:%s",
+							len(theirVersions),
+							strings.Join(detail, "\n"),
+						))
+					} else {
+						slog.Info(fmt.Sprintf("Peer sent %d new versions", len(theirVersions)))
+					}
+				} else {
+					slog.Debug(fmt.Sprintf("Peer sent %d versions, none of which were new", len(theirVersions)))
 				}
 			} else {
 				slog.Warn("Gossip failed with : " + err.Error())

@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/gob"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jolynch/vwatch/internal/api"
@@ -34,10 +36,15 @@ var (
 
 type Watcher struct {
 	Signal chan string
+	NumConsumers *atomic.Int64
 }
 
 func makeWatcher() Watcher {
-	return Watcher{Signal: make(chan string)}
+	var consumer atomic.Int64
+	return Watcher{
+		Signal: make(chan string),
+		NumConsumers: &consumer,
+	}
 }
 
 func loadOrStoreWatcher(name, version string) Watcher {
@@ -59,7 +66,7 @@ func loadOrStoreWatcherMap(name string) *sync.Map {
 	return versionMap.(*sync.Map)
 }
 
-func storeNewVersion(name string, version api.Version) (stored bool) {
+func storeNewVersion(name string, version api.Version) (result api.Version) {
 	// Up until now we have done optimistic concurrency control on versions, when we actually go
 	// to store the version and wake all watchers on versions not equal to that version, we need
 	// to lock for the Compare And Swap operation. Otherwise we could be storing new versions
@@ -67,15 +74,13 @@ func storeNewVersion(name string, version api.Version) (stored bool) {
 	versionLock.Lock()
 	defer versionLock.Unlock()
 
-	stored = true
+	result = version
 	pv, hasVersion := versions.Load(name)
-	pw, hasWatch := watchers.Load(name)
 
-	// When acting as a cache, we have nothing to do if there has never been a
-	// watch for this key
-	if config.FillStrategy == repl.FillCache && !hasWatch {
-		return
-	}
+	// Potential optimization if we find this is an issue with artifact cardinality
+	// if config.FillStrategy == repl.FillCache && !hasWatch {
+	//	return false
+	// }
 
 	if hasVersion {
 		prev := pv.(api.Version).LastSync.UnixNano()
@@ -83,12 +88,13 @@ func storeNewVersion(name string, version api.Version) (stored bool) {
 			versions.Store(name, version)
 		} else {
 			version = pv.(api.Version)
-			stored = false
+			result = version
 		}
 	} else {
 		versions.Store(name, version)
 	}
 
+	pw, hasWatch := watchers.Load(name)
 	// Only wake watchers if they exist, we may receive writes for names
 	// that are not watched at all.
 	if hasWatch {
@@ -104,7 +110,7 @@ func storeNewVersion(name string, version api.Version) (stored bool) {
 			return true
 		})
 	}
-	return stored
+	return result
 }
 
 func putVersion(w http.ResponseWriter, req *http.Request) {
@@ -168,11 +174,16 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		version.Version = fmt.Sprintf("xxh3:%08x%08x", checksum.Hi, checksum.Lo)
 	}
 
-	upsertVersion(name, version)
+	latestVersion := upsertVersion(name, version)
 	// ETag must be enclosed in double quotes
-	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
-	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
-	w.WriteHeader(http.StatusNoContent)
+	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", latestVersion.Version))
+	w.Header().Set(headers.LastModified, latestVersion.LastSync.UTC().Format(http.TimeFormat))
+
+	if latestVersion.Version == version.Version {
+		w.WriteHeader(http.StatusNoContent)
+	} else {
+		w.WriteHeader(http.StatusConflict)
+	}
 }
 
 func getVersion(w http.ResponseWriter, req *http.Request) {
@@ -197,11 +208,26 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	if !ok {
 		if filler != nil {
 			params := parse.ParseName(name)
-			version, err = filler.Fill(params, req.URL.Query())
-			if err == nil {
-				upsertVersion(name, version)
-				val, ok = versions.Load(name)
+			resp := make(chan api.Version, 1)
+			// Need to respect timeout when making fill calls
+			go func(response chan api.Version) {
+				version, err := filler.Fill(params, req.URL.Query())
+				if err == nil {
+					response <- version
+				}
+				close(response)
+			}(resp)
+
+			select {
+			case version, ok = <-resp:
+				slog.Debug(fmt.Sprintf("Unblocking Fill GET[%s] due to result", name))
+				if ok {
+					upsertVersion(name, version)
+				}
+			case <-time.After(timeout):
+				slog.Debug(fmt.Sprintf("Unblocking Fill GET[%s] due to %s timeout", name, timeout))
 			}
+			val, ok = versions.Load(name)
 		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -226,6 +252,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	if previousVersion != "" && previousVersion == version.Version {
 		// Long poll on this version
 		watcher := loadOrStoreWatcher(name, version.Version)
+		watcher.NumConsumers.Add(1)
 
 		select {
 		case <-watcher.Signal:
@@ -233,15 +260,21 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 		case <-time.After(timeout):
 			slog.Debug(fmt.Sprintf("Unblocking GET[%s] due to %s timeout", name, timeout))
 		}
+		numWatchers := watcher.NumConsumers.Add(-1) + 1
 
 		val, ok = versions.Load(name)
 		if !ok {
 			http.Error(w, fmt.Sprintf("%s not found", name), http.StatusNotFound)
+			return
 		}
 		version = val.(api.Version)
-		if config.JitterFor.Milliseconds() > 0 {
-			jitterDuration := time.Duration(rand.Int63n(config.JitterFor.Milliseconds())) * time.Millisecond
-			timings = append(timings, fmt.Sprintf("jitter;dur=%s", jitterDuration.Round(time.Millisecond).String()))
+		if config.JitterPerWatch.Milliseconds() > 0 {
+			jitterTarget := numWatchers * config.JitterPerWatch.Milliseconds()
+			jitterDuration := time.Duration(rand.Int63n(jitterTarget)) * time.Millisecond
+			timings = append(
+				timings,
+				fmt.Sprintf("jitter;dur=%s", jitterDuration.Round(time.Millisecond).String()),
+			)
 			time.Sleep(jitterDuration)
 		}
 	}
@@ -252,37 +285,59 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	// ETag must be enclosed in double quotes
 	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
-	w.Header().Set(headers.ContentType, "application/octet-stream")
+	w.Header().Set(headers.ContentType, headers.ContentTypeBytes)
 	w.Header().Add(headers.ServerTiming, strings.Join(timings, ", "))
 	w.WriteHeader(http.StatusOK)
 	w.Write(version.Data)
 }
 
-func upsertVersion(name string, version api.Version) bool {
+func upsertVersion(name string, version api.Version) api.Version {
 	pv, ok := versions.Load(name)
 	if ok {
 		prev := pv.(api.Version).LastSync.UnixNano()
 		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
 			return storeNewVersion(name, version)
 		}
-		return false
+		return pv.(api.Version)
 	} else {
 		return storeNewVersion(name, version)
 	}
 }
 
 func replicate(w http.ResponseWriter, req *http.Request) {
-	decoder := gob.NewDecoder(req.Body)
-	var remoteVersions []api.Version
-	err := decoder.Decode(&remoteVersions)
-	if err != nil {
-		http.Error(w, "Failed decoding gob data", http.StatusBadRequest)
-		return
+	var (
+		remoteVersions []api.Version
+		err            error
+	)
+
+	contentType := req.Header.Get(headers.ContentType)
+	switch contentType {
+	case headers.ContentTypeBytes:
+		err = gob.NewDecoder(req.Body).Decode(&remoteVersions)
+		if err != nil {
+			http.Error(w, "Failed decoding gob data: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+	default:
+		contentType = headers.ContentTypeJson
+		err = json.NewDecoder(req.Body).Decode(&remoteVersions)
+		if err != nil {
+			http.Error(w, "Failed decoding json data: "+err.Error(), http.StatusBadRequest)
+			return
+		}
 	}
+	slog.Debug(fmt.Sprintf("/v1/versions detected content-type: %s", contentType))
+
 	var remoteKeys map[string]bool = make(map[string]bool)
-	var deltas []api.Version
+	var deltas []api.Version = make([]api.Version, 0)
 	// Limit single response to 1MiB at a time (by default)
 	var budgetBytes = int(config.ReplicateLimitBytes)
+	// shuffle remote Versions to ensure progress even if we are hitting our limits
+	rand.Shuffle(
+		len(remoteVersions),
+		func(i, j int) {
+			remoteVersions[i], remoteVersions[j] = remoteVersions[j], remoteVersions[i]
+		})
 
 	for _, version := range remoteVersions {
 		remoteKeys[version.Name] = true
@@ -299,8 +354,10 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 			break
 		}
 	}
+
 	versions.Range(func(key, value any) bool {
 		if budgetBytes < 0 {
+			slog.Debug(fmt.Sprintf("/v1/versions hitting budget after %d bytes", config.ReplicateLimitBytes))
 			return false
 		}
 		_, seen := remoteKeys[key.(string)]
@@ -311,9 +368,14 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 		return budgetBytes >= 0
 	})
 
-	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set(headers.ContentType, contentType)
 	w.WriteHeader(http.StatusOK)
-	gob.NewEncoder(w).Encode(deltas)
+	switch contentType {
+	case headers.ContentTypeBytes:
+		gob.NewEncoder(w).Encode(deltas)
+	case headers.ContentTypeJson:
+		json.NewEncoder(w).Encode(deltas)
+	}
 }
 
 func setLogLevel(w http.ResponseWriter, req *http.Request) {
@@ -331,21 +393,21 @@ func setLogLevel(w http.ResponseWriter, req *http.Request) {
 	http.Error(w, "/log requires a ?level=DEBUG param", http.StatusBadRequest)
 }
 
-var paths = `HTTP Server Paths:
-
-GET /version/{repository}[:{tag}]?[version=last_seen]         -> Get latest version or block for new version
-PUT /version/{repository}[:{tag}]?[version=version] <- <data> -> Set latest version, unblocking watches
-PUT /logging?level=DEBUG                                      -> Set log level
-
-Internal endpoints you should probably avoid unless you know what you are doing
-POST /replicate                            <- gob([]Version) -> Replicate state between leaders
+var frontendPaths = `Client HTTP Server Paths:
+GET /v1/versions/{name}?[version={last_version}]         -> Get latest version or block for new version
+PUT /v1/versions/{name}?[version={version}]    <- {data} -> Set latest version, unblocking watches
+`
+var backendPaths = `Server HTTP Server Paths:
+ PUT /v1/logging?level=DEBUG                            -> Set log level
+POST /v1/versions                                       <- gob([]Version) | json([]Version) -> Replicate state between leaders
 `
 
 func main() {
 	config = conf.FromEnv()
 
-	flag.StringVar(&config.Listen, "listen", config.Listen, "The address to listen on")
-	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips")
+	flag.StringVar(&config.ListenClient, "listen-client", config.ListenClient, "The address to listen on for clients")
+	flag.StringVar(&config.ListenServer, "listen-server", config.ListenServer, "The address to listen on for server traffic (replication)")
+	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips. This should be their server-listen address!")
 	flag.DurationVar(&config.ReplicateEvery, "replicate-interval", config.ReplicateEvery, "How often to exchange state with peers")
 	flag.DurationVar(&config.ReplicateResolveEvery, "replicate-resolve-interval", config.ReplicateResolveEvery, "How often to resolve replicate-with to find peers")
 
@@ -355,7 +417,7 @@ func main() {
 	flag.StringVar(&config.FillStrategy, "fill-strategy", config.FillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
 	flag.Uint64Var(&config.DataLimitBytes, "data-limit", config.DataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
 	flag.DurationVar(&config.BlockFor, "block-for", config.BlockFor, "The duration to block GETs by default for")
-	flag.DurationVar(&config.JitterFor, "jitter-for", config.JitterFor, "The duration to jitter blocking GETs by, should be less than block-for")
+	flag.DurationVar(&config.JitterPerWatch, "jitter-per-watch", config.JitterPerWatch, "The duration to jitter blocking GETs by proportional to the number of outstanding watches on this version")
 	flag.Parse()
 
 	badStrategy := slices.Contains(repl.ValidFillStrategies, config.FillStrategy)
@@ -372,19 +434,38 @@ func main() {
 	if config.ReplicateWith != "" {
 		setupReplication()
 	}
-	http.HandleFunc("PUT /version/{name...}", putVersion)
-	http.HandleFunc("GET /version/{name...}", getVersion)
-	http.HandleFunc("PUT /logging", setLogLevel)
-	http.HandleFunc("POST /replicate", replicate)
 
-	slog.Info(fmt.Sprintf("Listening at %s", config.Listen))
-	slog.Info(paths)
-	err := http.ListenAndServe(config.Listen, nil)
+	// Setup the public (client/frontend) and private (server/backend) HTTP apis
+	go listenForClients()
+	go listenForServers()
+	select {}
+}
+
+func listenForClients() {
+	// External "Client" endpoints
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/versions/{name...}", putVersion)
+	mux.HandleFunc("GET /v1/versions/{name...}", getVersion)
+	slog.Info(fmt.Sprintf("Listening for Frontend Traffic at %s", config.ListenClient))
+	slog.Info(frontendPaths)
+	err := http.ListenAndServe(config.ListenClient, mux)
 	if err != nil {
-		slog.Error("Failed to bind, is another server listening at this address?")
+		slog.Error(fmt.Sprintf("Failed to bind %s, is another server already listening?", config.ListenClient))
 		os.Exit(1)
-	} else {
-		slog.Info("All Done!")
+	}
+}
+
+func listenForServers() {
+	// Internal "Server" endpoints, typically exposed to localhost unless we are replicating
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/logging", setLogLevel)
+	mux.HandleFunc("POST /v1/versions", replicate)
+	slog.Info(fmt.Sprintf("Listening for Backend traffic at %s", config.ListenServer))
+	slog.Info(backendPaths)
+	err := http.ListenAndServe(config.ListenServer, mux)
+	if err != nil {
+		slog.Error(fmt.Sprintf("Failed to bind %s, is another server already listening?", config.ListenServer))
+		os.Exit(1)
 	}
 }
 
