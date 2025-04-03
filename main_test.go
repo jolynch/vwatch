@@ -195,7 +195,7 @@ func BenchmarkConcurrentReadWithWrite(b *testing.B) {
 	}
 
 	for _, testCase := range testCases {
-		b.Run(testCase.name, func(b *testing.B) { 
+		b.Run(testCase.name, func(b *testing.B) {
 			doConcurrentReadWithWrite(b, "img", testCase.numReaders)
 		})
 	}

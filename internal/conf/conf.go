@@ -75,7 +75,7 @@ func FromEnv() Config {
 		FillExpiry:            EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
 		FillStrategy:          EnvString("VWATCH_FILL_STRATEGY", repl.FillWatch),
 		BlockFor:              EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
-		JitterPerWatch:         EnvDuration("VWATCH_JITTER_PER_WATCH", 1*time.Millisecond),
+		JitterPerWatch:        EnvDuration("VWATCH_JITTER_PER_WATCH", 1*time.Millisecond),
 		LogLevel:              EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
 		DataLimitBytes:        EnvUint("VWATCH_DATA_LIMIT_BYTES", 4*1024),
 	}

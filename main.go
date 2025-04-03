@@ -35,14 +35,14 @@ var (
 )
 
 type Watcher struct {
-	Signal chan string
+	Signal       chan string
 	NumConsumers *atomic.Int64
 }
 
 func makeWatcher() Watcher {
 	var consumer atomic.Int64
 	return Watcher{
-		Signal: make(chan string),
+		Signal:       make(chan string),
 		NumConsumers: &consumer,
 	}
 }
