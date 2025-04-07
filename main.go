@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/gob"
 	"encoding/json"
 	"flag"
@@ -160,14 +161,19 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		version.Version = v[0]
 	}
 
-	// Data comes from the first dataLimitBytes of the request body
-	buf := make([]byte, config.DataLimitBytes)
-	n, err := io.ReadFull(req.Body, buf)
-	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+	// Data comes from the first DataLimitBytes of the request body
+	buf := new(bytes.Buffer)
+	limit := int64(config.DataLimitBytes)
+	n, err := io.CopyN(buf, req.Body, limit+1)
+	if err != nil && err != io.EOF {
 		http.Error(w, "Error while reading body: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	version.Data = buf[:n]
+	if n > limit && config.DataLimitError {
+		http.Error(w, fmt.Sprintf("Body larger than DataLimitBytes=%d", limit), http.StatusRequestEntityTooLarge)
+		return
+	}
+	version.Data = buf.Bytes()[:min(limit, n)]
 
 	if version.Version == "" {
 		checksum := xxh3.Hash128(version.Data)
@@ -203,7 +209,12 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			http.Error(w, "Invalid timeout duration, try something like 10s", http.StatusBadRequest)
 			return
 		}
+		if timeout > max(1*time.Minute, config.BlockFor) {
+			http.Error(w, fmt.Sprintf("User cannot request block for more than %s", max(1*time.Minute, config.BlockFor)), http.StatusBadRequest)
+			return
+		}
 	}
+
 	val, ok := versions.Load(name)
 	if !ok {
 		if filler != nil {
@@ -270,7 +281,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 		version = val.(api.Version)
 		if config.JitterPerWatch.Milliseconds() > 0 {
 			jitterTarget := numWatchers * config.JitterPerWatch.Milliseconds()
-			jitterDuration := time.Duration(rand.Int63n(jitterTarget)) * time.Millisecond
+			jitterDuration := min(config.BlockFor, time.Duration(rand.Int63n(jitterTarget))*time.Millisecond)
 			timings = append(
 				timings,
 				fmt.Sprintf("jitter;dur=%s", jitterDuration.Round(time.Millisecond).String()),
@@ -415,7 +426,8 @@ func main() {
 	flag.StringVar(&config.FillPath, "fill-path", config.FillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
 	flag.DurationVar(&config.FillExpiry, "fill-expiry", config.FillExpiry, "Ask the upstream at least once every interval, for example 10s we would ask upstream every 10s")
 	flag.StringVar(&config.FillStrategy, "fill-strategy", config.FillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
-	flag.Uint64Var(&config.DataLimitBytes, "data-limit", config.DataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
+	flag.Uint64Var(&config.DataLimitBytes, "data-limit-bytes", config.DataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
+	flag.BoolVar(&config.DataLimitError, "data-limit-error", config.DataLimitError, "When data exceeds the limit, should an error occur.")
 	flag.DurationVar(&config.BlockFor, "block-for", config.BlockFor, "The duration to block GETs by default for")
 	flag.DurationVar(&config.JitterPerWatch, "jitter-per-watch", config.JitterPerWatch, "The duration to jitter blocking GETs by proportional to the number of outstanding watches on this version")
 	flag.Parse()

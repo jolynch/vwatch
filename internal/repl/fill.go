@@ -78,7 +78,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 		}
 	}
 
-	var data []byte
+	data := []byte{}
 	if filler.FillBody {
 		data, err = io.ReadAll(resp.Body)
 		if err != nil {
@@ -109,7 +109,7 @@ func (filler Filler) Watch(state *sync.Map, fillExpiry time.Duration, newVersion
 	slog.Info("Starting Filler Watch")
 	for {
 		params := <-filler.Channel
-		slog.Info("Spawning Watcher for: [" + params["name"] + "]")
+		slog.Info(fmt.Sprintf("Spawning Watcher for: [%s]", params["name"]))
 		go watch(filler, params["name"], state, fillExpiry, newVersion, fillStrategy, params)
 	}
 }

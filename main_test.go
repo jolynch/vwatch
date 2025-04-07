@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"math/rand"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"reflect"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -20,42 +20,70 @@ import (
 	"github.com/jolynch/vwatch/internal/parse"
 )
 
-func writeVersion(name string, version string, body []byte) *httptest.ResponseRecorder {
+// So we can log and assert on either Fuzz or Benchmark
+type Tester interface {
+	Logf(format string, args ...any)
+	Fatalf(format string, args ...any)
+}
+
+func writeVersion(t Tester, name string, version string, body []byte) (recorder *httptest.ResponseRecorder, err error) {
 	var buf bytes.Buffer
 	buf.Write(body)
 
-	uri := "/v1/versions/" + name
+	uri := "/v1/versions/" + url.PathEscape(name)
 	if version != "" {
 		params := url.Values{}
 		params.Add("version", version)
 		uri = fmt.Sprintf("%s?%s", uri, params.Encode())
 	}
-	request, _ := http.NewRequest("PUT", uri, &buf)
+	request, err := http.NewRequest("PUT", uri, &buf)
+	if request == nil {
+		err = errors.New("Invalid request")
+		return
+	}
+	t.Logf("Writing name=[%s] version=[%s]", name, version)
 	request.SetPathValue("name", name)
-	recorder := httptest.NewRecorder()
+	recorder = httptest.NewRecorder()
 	putVersion(recorder, request)
-	return recorder
+	return recorder, err
 }
 
-func readVersion(name string, version string, timeout time.Duration) *httptest.ResponseRecorder {
-	uri := "/v1/versions/" + name
+func readVersion(t Tester, name string, version string, timeout time.Duration) *httptest.ResponseRecorder {
+	uri := "/v1/versions/" + url.PathEscape(name)
 	if version != "" {
 		params := url.Values{}
 		params.Add("version", version)
 		params.Add("timeout", timeout.String())
 		uri = fmt.Sprintf("%s?%s", uri, params.Encode())
 	}
+	if timeout > 2*time.Second {
+		t.Fatalf("Cannot block reads for >s")
+	}
 
+	//t.Logf("GET [%s]", uri)
 	request, _ := http.NewRequest("GET", uri, nil)
 	request.SetPathValue("name", name)
 	recorder := httptest.NewRecorder()
-	getVersion(recorder, request)
+
+	done := make(chan bool, 1)
+	go func() {
+		getVersion(recorder, request)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatalf("Should not have blocked for more than 2 seconds")
+	}
+
 	return recorder
 }
 
-func FuzzTestReadPutVersion(f *testing.F) {
+func FuzzReadPutVersion(f *testing.F) {
 	config = conf.FromEnv()
 	config.JitterPerWatch = 10 * time.Millisecond
+	config.DataLimitBytes = 1024
+	config.DataLimitError = false
 
 	f.Add("repo/image:tag", "", []byte("123"))
 	f.Add("artifact", "123", []byte("456"))
@@ -64,37 +92,53 @@ func FuzzTestReadPutVersion(f *testing.F) {
 	f.Fuzz(func(t *testing.T, name string, version string, data []byte) {
 		if !utf8.ValidString(name) || !utf8.ValidString(version) {
 			t.Skip()
+			return
 		}
-		verifyNotEmpty := func(value string) string {
+		verifyNotEmpty := func(value string, ctx string) string {
 			if value == "" {
-				t.Errorf("Expected nonempty")
+				t.Fatalf("Expected nonempty value for %s", ctx)
 			}
 			return value
 		}
 
-		write := writeVersion(name, "", data)
-		writtenEtag := verifyNotEmpty(write.Header().Get(headers.ETag))
-		lastModified := verifyNotEmpty(write.Header().Get(headers.LastModified))
-		_, err := time.Parse(http.TimeFormat, lastModified)
+		write, err := writeVersion(t, name, "", data)
+		if err != nil {
+			// This can only happen if the name can't be put in the path variable
+			t.Skipf("Could not construct proper request from name: %s", err.Error())
+			return
+		}
+		t.Logf("Write Response: %d\n", write.Code)
+		writtenEtag := verifyNotEmpty(write.Header().Get(headers.ETag), "Write ETag")
+		lastModified := verifyNotEmpty(write.Header().Get(headers.LastModified), "Write LastModified")
+		_, err = time.Parse(http.TimeFormat, lastModified)
 		if err != nil {
 			t.Error(err)
 		}
 
-		read := readVersion(name, "", 0*time.Second)
-		readEtag := verifyNotEmpty(read.Header().Get(headers.ETag))
+		read := readVersion(t, name, "", 0*time.Second)
+		readEtag := verifyNotEmpty(read.Header().Get(headers.ETag), "Read ETag")
 		if readEtag != writtenEtag {
 			t.Errorf("Expected %s from write but got %s from read", writtenEtag, readEtag)
 		}
 		var result bytes.Buffer
 		read.Body.WriteTo(&result)
-		if !reflect.DeepEqual(result.Bytes(), data) {
-			t.Errorf("Expected GET to return data that was PUT")
+
+		// If a body exceeds the DataLimitBytes it should be truncated of data, no more
+		actual := result.Bytes()
+		expected := data[:min(len(data), int(config.DataLimitBytes))]
+		if !bytes.Equal(actual, expected) {
+			fmt.Printf("[%x] vs [%x]", actual, expected)
+			t.Errorf("Expected GET to return firt 1KiB of data that was PUT: actual=[0x%x] vs expected=[0x%x]", actual, expected)
+		}
+		if uint64(len(result.Bytes())) > config.DataLimitBytes {
+			t.Errorf("Should have only read 1KiB no-matter the size of input data")
 		}
 
-		// Now test blocking
+		// Now test blocking read
 		start := time.Now()
-		blockingRead := readVersion(name, writtenEtag, 10*time.Millisecond)
-		blockedEtag := verifyNotEmpty(blockingRead.Header().Get(headers.ETag))
+		t.Logf("Starting blocking read for name=[%s], version=[%s]", name, writtenEtag)
+		blockingRead := readVersion(t, name, writtenEtag, 10*time.Millisecond)
+		blockedEtag := verifyNotEmpty(blockingRead.Header().Get(headers.ETag), "Read ETag")
 		delta := time.Since(start)
 		if blockedEtag != writtenEtag {
 			t.Errorf("Expected %s from write but got %s from read", writtenEtag, blockedEtag)
@@ -110,7 +154,10 @@ func BenchmarkConcurrentReaders(b *testing.B) {
 	config.JitterPerWatch = 0 * time.Millisecond
 
 	name := "simple"
-	resp := writeVersion(name, "", []byte("test"))
+	resp, err := writeVersion(b, name, "", []byte("test"))
+	if err != nil {
+		b.Error(err)
+	}
 	version := resp.Header().Get(headers.ETag)
 
 	b.Run("1:100000 Blocking", func(b *testing.B) {
@@ -120,7 +167,7 @@ func BenchmarkConcurrentReaders(b *testing.B) {
 
 			go func() {
 				defer wg.Done()
-				resp = readVersion(name, version, 100*time.Millisecond)
+				resp = readVersion(b, name, version, 100*time.Millisecond)
 				if resp.Header().Get(headers.ETag) != version {
 					b.Errorf("Should have gotten written version")
 				}
@@ -138,7 +185,10 @@ func doConcurrentReadWithWrite(b *testing.B, name string, numReaders int) {
 
 	doWrite := func(i int64) {
 		version := fmt.Sprintf("%d", i)
-		resp := writeVersion(name, version, []byte(fmt.Sprintf("test-%d", i)))
+		resp, err := writeVersion(b, name, version, []byte(fmt.Sprintf("test-%d", i)))
+		if err != nil {
+			b.Error(err)
+		}
 
 		hdr := parse.ParseETagToVersion(resp.Header().Get(headers.ETag))
 		if hdr != version {
@@ -169,7 +219,7 @@ func doConcurrentReadWithWrite(b *testing.B, name string, numReaders int) {
 			// Counter is incremented after the set, so we should always be "behind" the
 			// writer goroutine
 			before := counter.Load()
-			resp := readVersion(name, fmt.Sprintf("%d", before), 1*time.Second)
+			resp := readVersion(b, name, fmt.Sprintf("%d", before), 1*time.Second)
 			result := parse.ParseETagToVersion(resp.Header().Get(headers.ETag))
 
 			actual, err := strconv.ParseInt(result, 10, 0)

@@ -27,6 +27,7 @@ type Config struct {
 	JitterPerWatch        time.Duration `json:"jitter-per-watch"`
 	LogLevel              slog.Level    `json:"log-level"`
 	DataLimitBytes        uint64        `json:"data-limit-bytes"`
+	DataLimitError        bool          `json:"data-limit-error"`
 }
 
 func (config Config) PrettyRepr() string {
@@ -56,6 +57,8 @@ func repr(val any) (result string) {
 		result = fmt.Sprintf("%d", v)
 	case slog.Level:
 		result = fmt.Sprintf("\"%s\"", v.String())
+	case bool:
+		result = fmt.Sprintf("%t", v)
 	default:
 		result = fmt.Sprintf("\"%s\"", v)
 	}
@@ -78,23 +81,18 @@ func FromEnv() Config {
 		JitterPerWatch:        EnvDuration("VWATCH_JITTER_PER_WATCH", 1*time.Millisecond),
 		LogLevel:              EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
 		DataLimitBytes:        EnvUint("VWATCH_DATA_LIMIT_BYTES", 4*1024),
+		DataLimitError:        EnvBool("VWATCH_DATA_LIMIT_ERROR", true),
 	}
 }
 
-func EnvString(key string, fallback string) string {
-	v, ok := os.LookupEnv(key)
-	if ok {
-		return v
-	}
-	return fallback
-}
+type Mapper[V any] func(value string) (V, error)
 
-func EnvDuration(key string, fallback time.Duration) time.Duration {
+func EnvVal[V any](key string, fallback V, mapper Mapper[V]) V {
 	v, ok := os.LookupEnv(key)
 	if ok {
-		d, err := time.ParseDuration(v)
+		d, err := mapper(v)
 		if err != nil {
-			slog.Error(fmt.Sprintf("Invalid duration %s=%s: %s", key, v, err.Error()))
+			slog.Error(fmt.Sprintf("Invalid type for %s=%s: %s", key, v, err.Error()))
 			os.Exit(2)
 		}
 		return d
@@ -102,30 +100,24 @@ func EnvDuration(key string, fallback time.Duration) time.Duration {
 	return fallback
 }
 
+func EnvString(key string, fallback string) string {
+	return EnvVal(key, fallback, identity)
+}
+
+func EnvDuration(key string, fallback time.Duration) time.Duration {
+	return EnvVal(key, fallback, time.ParseDuration)
+}
+
 func EnvUint(key string, fallback uint64) uint64 {
-	v, ok := os.LookupEnv(key)
-	if ok {
-		n, err := strconv.ParseUint(v, 10, 64)
-		if err != nil {
-			slog.Error(fmt.Sprintf("Invalid uint %s=%s: %s", key, v, err.Error()))
-			os.Exit(2)
-		}
-		return n
-	}
-	return fallback
+	return EnvVal(key, fallback, parseUint)
+}
+
+func EnvBool(key string, fallback bool) bool {
+	return EnvVal(key, fallback, strconv.ParseBool)
 }
 
 func EnvLogLevel(key string, fallback slog.Level) slog.Level {
-	v, ok := os.LookupEnv(key)
-	if ok {
-		slevel, err := LogLevel(v, fallback)
-		if err != nil {
-			slog.Error(fmt.Sprintf("Invalid LogLevel %s=%s: %s", key, v, err.Error()))
-			os.Exit(2)
-		}
-		return slevel
-	}
-	return fallback
+	return EnvVal(key, fallback, func(value string) (slog.Level, error) { return LogLevel(value, fallback) })
 }
 
 func LogLevel(value string, fallback slog.Level) (level slog.Level, err error) {
@@ -135,4 +127,12 @@ func LogLevel(value string, fallback slog.Level) (level slog.Level, err error) {
 		return
 	}
 	return
+}
+
+func parseUint(value string) (uint64, error) {
+	return strconv.ParseUint(value, 10, 64)
+}
+
+func identity(value string) (string, error) {
+	return value, nil
 }
