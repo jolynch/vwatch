@@ -12,16 +12,12 @@ import (
 	"time"
 
 	"github.com/jolynch/vwatch/internal/api"
+	"github.com/jolynch/vwatch/internal/conf"
 	"github.com/jolynch/vwatch/internal/parse"
 )
 
-const (
-	FillWatch = "FILL_WATCH"
-	FillCache = "FILL_CACHE"
-)
-
 var (
-	ValidFillStrategies = []string{FillCache, FillWatch}
+	ValidFillStrategies = []string{conf.FillCache, conf.FillWatch}
 )
 
 type Filler struct {
@@ -143,7 +139,7 @@ func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration
 					go storeNewVersion(name, version)
 				}
 			}
-			if fillStrategy == FillCache {
+			if fillStrategy == conf.FillCache {
 				time.Sleep(fillExpiry)
 			}
 		}

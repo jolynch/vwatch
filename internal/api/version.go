@@ -37,6 +37,6 @@ func (version Version) Format(maxDataLength int) string {
 	// JSON doesn't handle binary or timestamps great, just Sprintf it
 	return fmt.Sprintf(
 		"{name=%s, version=%s, last-sync=%s, data=%s}",
-		version.Name, version.Version, version.LastSync, data,
+		version.Name, version.Version, version.LastSync.Format(time.RFC3339), data,
 	)
 }

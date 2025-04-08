@@ -2,6 +2,7 @@ package repl
 
 import (
 	"bytes"
+	"context"
 	"encoding/gob"
 	"fmt"
 	"log/slog"
@@ -16,9 +17,12 @@ import (
 	"time"
 
 	"github.com/jolynch/vwatch/internal/api"
+	"github.com/jolynch/vwatch/internal/conf"
+	"github.com/jolynch/vwatch/internal/headers"
 )
 
 type Gossiper struct {
+	Config     conf.Config
 	Addrs      []string
 	Client     *http.Client
 	LocalState *sync.Map
@@ -27,8 +31,8 @@ type Gossiper struct {
 }
 
 func (gossiper *Gossiper) findPeers() {
+	var peers []string
 	for _, addr := range gossiper.Addrs {
-		var peers []string
 		u, err := url.Parse(addr)
 		if err == nil {
 			host, port, err := net.SplitHostPort(u.Host)
@@ -57,22 +61,74 @@ func (gossiper *Gossiper) findPeers() {
 			} else {
 				slog.Warn("Gossiper failed to lookup ips: " + err.Error())
 			}
-			// Always keep last peer around
-			if len(peers) > 0 {
-				slices.Sort(peers)
-				gossiper.PeerMutex.Lock()
-				if !reflect.DeepEqual(peers, gossiper.Peers) {
-					slog.Info(fmt.Sprintf("Gossiper found %d peers %+v", len(peers), peers))
-					gossiper.Peers = peers
-				}
-				gossiper.PeerMutex.Unlock()
-			} else {
-				slog.Warn("Gossiper failed to resolve any peers")
-			}
 		} else {
 			slog.Warn(fmt.Sprintf("Gossiper failed to parse address [%s]: %s", addr, err))
 		}
 	}
+	// Always keep last peer around until we have more
+	if len(peers) > 0 {
+		slices.Sort(peers)
+		gossiper.PeerMutex.Lock()
+		if !reflect.DeepEqual(peers, gossiper.Peers) {
+			slog.Info(fmt.Sprintf("Gossiper found %d peers %+v", len(peers), peers))
+			gossiper.Peers = peers
+		}
+		gossiper.PeerMutex.Unlock()
+	} else {
+		slog.Warn("Gossiper failed to resolve any peers")
+	}
+}
+
+type WriteResult struct {
+	Successful []string
+	Failed     []string
+}
+
+func (gossiper *Gossiper) Write(version api.Version) (result WriteResult, err error) {
+	if version.Name == "" || version.Version == "" {
+		return
+	}
+	start := time.Now()
+
+	gossiper.PeerMutex.RLock()
+	peersCopy := make([]string, len(gossiper.Peers))
+	_ = copy(peersCopy, gossiper.Peers)
+	gossiper.PeerMutex.RUnlock()
+
+	var req *http.Request
+	for _, peer := range peersCopy {
+		uri := peer + "/" + url.PathEscape(version.Name)
+		if version.Version != "" {
+			params := url.Values{}
+			params.Add("version", version.Version)
+			params.Add("modified", version.LastSync.Format(time.RFC3339))
+			params.Add("source", gossiper.Config.NodeId)
+			uri = fmt.Sprintf("%s?%s", uri, params.Encode())
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+
+		req, err = http.NewRequestWithContext(ctx, http.MethodPut, uri, bytes.NewBuffer(version.Data))
+		req.Header.Set(headers.ContentType, headers.ContentTypeBytes)
+		if err != nil {
+			return
+		}
+
+		_, err = gossiper.Client.Do(req)
+		if err == nil {
+			result.Successful = append(result.Successful, peer)
+		} else {
+			result.Failed = append(result.Failed, peer)
+		}
+	}
+	delta := time.Since(start)
+	if len(peersCopy) > 0 {
+		slog.Info(fmt.Sprintf("Sent [%s] to %d/%d peers after %s", version.Format(0), len(result.Successful), len(peersCopy), delta))
+		if len(result.Failed) > 0 {
+			slog.Warn("Failed to replicate [%s] to: %v", version.Name, peersCopy)
+		}
+	}
+	return result, err
 }
 
 func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time.Duration) {
@@ -95,9 +151,15 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 				myVersions = append(myVersions, api.Version{Name: name, Version: version, LastSync: ts})
 				return true
 			})
+
 			var buf bytes.Buffer
+			versionSet := api.VersionSet{
+				Protocol: 0,
+				Versions: myVersions,
+			}
+
 			enc := gob.NewEncoder(&buf)
-			enc.Encode(myVersions)
+			enc.Encode(versionSet)
 			resp, err := gossiper.Client.Post(peer, "application/octet-stream", &buf)
 			if err == nil {
 				var theirVersions []api.Version

@@ -121,7 +121,16 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		err     error
 	)
 
-	if filler != nil && config.FillStrategy == repl.FillWatch {
+	// Do not re-replicate replication requests from the same node
+	r, replicate := req.URL.Query()["source"]
+	if replicate && len(r[0]) >= 0 {
+		if r[0] == config.NodeId {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+	}
+
+	if filler != nil && config.FillStrategy == conf.FillWatch {
 		http.Error(w, "Replicating nodes in FILL_WATCH cannot accept writes", http.StatusMethodNotAllowed)
 		return
 	}
@@ -187,6 +196,10 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 
 	if latestVersion.Version == version.Version {
 		w.WriteHeader(http.StatusNoContent)
+		if gossiper != nil && !replicate {
+			// Best effort unblock peers
+			go gossiper.Write(version)
+		}
 	} else {
 		w.WriteHeader(http.StatusConflict)
 	}
@@ -317,21 +330,21 @@ func upsertVersion(name string, version api.Version) api.Version {
 
 func replicate(w http.ResponseWriter, req *http.Request) {
 	var (
-		remoteVersions []api.Version
-		err            error
+		versionSet api.VersionSet
+		err        error
 	)
 
 	contentType := req.Header.Get(headers.ContentType)
 	switch contentType {
 	case headers.ContentTypeBytes:
-		err = gob.NewDecoder(req.Body).Decode(&remoteVersions)
+		err = gob.NewDecoder(req.Body).Decode(&versionSet)
 		if err != nil {
 			http.Error(w, "Failed decoding gob data: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 	default:
 		contentType = headers.ContentTypeJson
-		err = json.NewDecoder(req.Body).Decode(&remoteVersions)
+		err = json.NewDecoder(req.Body).Decode(&versionSet)
 		if err != nil {
 			http.Error(w, "Failed decoding json data: "+err.Error(), http.StatusBadRequest)
 			return
@@ -339,10 +352,18 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 	}
 	slog.Debug(fmt.Sprintf("/v1/versions detected content-type: %s", contentType))
 
-	var remoteKeys map[string]bool = make(map[string]bool)
-	var deltas []api.Version = make([]api.Version, 0)
-	// Limit single response to 1MiB at a time (by default)
-	var budgetBytes = int(config.ReplicateLimitBytes)
+	if versionSet.Protocol != 0 {
+
+	}
+
+	var (
+		remoteVersions []api.Version   = versionSet.Versions
+		remoteKeys     map[string]bool = make(map[string]bool)
+		deltas         []api.Version   = make([]api.Version, 0)
+		// Limit single response to 1MiB at a time (by default)
+		budgetBytes = int(config.ReplicateLimitBytes)
+	)
+
 	// shuffle remote Versions to ensure progress even if we are hitting our limits
 	rand.Shuffle(
 		len(remoteVersions),
@@ -405,12 +426,12 @@ func setLogLevel(w http.ResponseWriter, req *http.Request) {
 }
 
 var frontendPaths = `Client HTTP Server Paths:
-GET /v1/versions/{name}?[version={last_version}]         -> Get latest version or block for new version
-PUT /v1/versions/{name}?[version={version}]    <- {data} -> Set latest version, unblocking watches
+GET /v1/versions/{name}?[version={last_version}]        -> Get latest version or block for new version
 `
 var backendPaths = `Server HTTP Server Paths:
  PUT /v1/logging?level=DEBUG                            -> Set log level
 POST /v1/versions                                       <- gob([]Version) | json([]Version) -> Replicate state between leaders
+ PUT /v1/versions/{name}?[version={version}]            <- {data}                           -> Set latest version, unblocking watches
 `
 
 func main() {
@@ -418,6 +439,7 @@ func main() {
 
 	flag.StringVar(&config.ListenClient, "listen-client", config.ListenClient, "The address to listen on for clients")
 	flag.StringVar(&config.ListenServer, "listen-server", config.ListenServer, "The address to listen on for server traffic (replication)")
+	flag.StringVar(&config.NodeId, "node-id", config.NodeId, "When replicating identify ourselves with this unique identifier")
 	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips. This should be their server-listen address!")
 	flag.DurationVar(&config.ReplicateEvery, "replicate-interval", config.ReplicateEvery, "How often to exchange state with peers")
 	flag.DurationVar(&config.ReplicateResolveEvery, "replicate-resolve-interval", config.ReplicateResolveEvery, "How often to resolve replicate-with to find peers")
@@ -447,18 +469,17 @@ func main() {
 		setupReplication()
 	}
 
-	// Setup the public (client/frontend) and private (server/backend) HTTP apis
-	go listenForClients()
-	go listenForServers()
+	// Setup the read-only client APIs and the writable server APIs
+	go listenForClientReads()
+	go listenForServerWrites()
 	select {}
 }
 
-func listenForClients() {
+func listenForClientReads() {
 	// External "Client" endpoints
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /v1/versions/{name...}", putVersion)
 	mux.HandleFunc("GET /v1/versions/{name...}", getVersion)
-	slog.Info(fmt.Sprintf("Listening for Frontend Traffic at %s", config.ListenClient))
+	slog.Info(fmt.Sprintf("Listening for Client Traffic at %s", config.ListenClient))
 	slog.Info(frontendPaths)
 	err := http.ListenAndServe(config.ListenClient, mux)
 	if err != nil {
@@ -467,12 +488,13 @@ func listenForClients() {
 	}
 }
 
-func listenForServers() {
-	// Internal "Server" endpoints, typically exposed to localhost unless we are replicating
+func listenForServerWrites() {
+	// Internal Writeable endpoints, separated
 	mux := http.NewServeMux()
-	mux.HandleFunc("PUT /v1/logging", setLogLevel)
 	mux.HandleFunc("POST /v1/versions", replicate)
-	slog.Info(fmt.Sprintf("Listening for Backend traffic at %s", config.ListenServer))
+	mux.HandleFunc("PUT /v1/versions/{name...}", putVersion)
+	mux.HandleFunc("PUT /v1/logging", setLogLevel)
+	slog.Info(fmt.Sprintf("Listening for Server traffic at %s", config.ListenServer))
 	slog.Info(backendPaths)
 	err := http.ListenAndServe(config.ListenServer, mux)
 	if err != nil {
@@ -488,6 +510,7 @@ func setupReplication() {
 		Timeout: config.BlockFor,
 	}
 	gossiper = &repl.Gossiper{
+		Config:     config,
 		Addrs:      addrs,
 		Client:     client,
 		LocalState: &versions,
@@ -507,7 +530,7 @@ func setupFill() {
 		Client:   client,
 		Monitor:  monitor,
 		Channel:  make(chan map[string]string, 2),
-		FillBody: config.FillStrategy == repl.FillWatch,
+		FillBody: config.FillStrategy == conf.FillWatch,
 	}
 	go filler.Watch(&versions, config.FillExpiry, storeNewVersion, config.FillStrategy)
 }

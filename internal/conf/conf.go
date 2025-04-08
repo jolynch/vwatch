@@ -3,18 +3,23 @@ package conf
 import (
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+)
 
-	"github.com/jolynch/vwatch/internal/repl"
+const (
+	FillWatch = "FILL_WATCH"
+	FillCache = "FILL_CACHE"
 )
 
 type Config struct {
 	ListenClient          string        `json:"client-listen"`
 	ListenServer          string        `json:"server-listen"`
+	NodeId                string        `json:"node-id"`
 	ReplicateWith         string        `json:"replicate-with"`
 	ReplicateEvery        time.Duration `json:"replicate-every"`
 	ReplicateResolveEvery time.Duration `json:"replicate-resolve-every"`
@@ -69,6 +74,7 @@ func FromEnv() Config {
 	return Config{
 		ListenClient:          EnvString("VWATCH_LISTEN_CLIENT", "127.0.0.1:8080"),
 		ListenServer:          EnvString("VWATCH_LISTEN_SERVER", "127.0.0.1:8008"),
+		NodeId:                EnvString("VWATCH_NODE_ID", fmt.Sprintf("%d", rand.Uint64())),
 		ReplicateWith:         EnvString("VWATCH_REPLICATE_WITH", ""),
 		ReplicateEvery:        EnvDuration("VWATCH_REPLICATE_EVERY", 1*time.Second),
 		ReplicateResolveEvery: EnvDuration("VWATCH_REPLICATE_RESOLVE_EVERY", 10*time.Second),
@@ -76,7 +82,7 @@ func FromEnv() Config {
 		FillFrom:              EnvString("VWATCH_FILL_FROM", ""),
 		FillPath:              EnvString("VWATCH_FILL_PATH", "/v1/versions/{{.name}}"),
 		FillExpiry:            EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
-		FillStrategy:          EnvString("VWATCH_FILL_STRATEGY", repl.FillWatch),
+		FillStrategy:          EnvString("VWATCH_FILL_STRATEGY", FillWatch),
 		BlockFor:              EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
 		JitterPerWatch:        EnvDuration("VWATCH_JITTER_PER_WATCH", 1*time.Millisecond),
 		LogLevel:              EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),
