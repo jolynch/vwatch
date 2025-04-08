@@ -7,6 +7,11 @@ import (
 	"unicode/utf8"
 )
 
+type VersionSet struct {
+	Protocol int       `json:"protocol"`
+	Versions []Version `json:"versions"`
+}
+
 type Version struct {
 	Name     string    `json:"name"`
 	Version  string    `json:"version"`
