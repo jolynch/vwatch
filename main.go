@@ -352,10 +352,6 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 	}
 	slog.Debug(fmt.Sprintf("/v1/versions detected content-type: %s", contentType))
 
-	if versionSet.Protocol != 0 {
-
-	}
-
 	var (
 		remoteVersions []api.Version   = versionSet.Versions
 		remoteKeys     map[string]bool = make(map[string]bool)
@@ -430,8 +426,8 @@ GET /v1/versions/{name}?[version={last_version}]        -> Get latest version or
 `
 var backendPaths = `Server HTTP Server Paths:
  PUT /v1/logging?level=DEBUG                            -> Set log level
-POST /v1/versions                                       <- gob([]Version) | json([]Version) -> Replicate state between leaders
- PUT /v1/versions/{name}?[version={version}]            <- {data}                           -> Set latest version, unblocking watches
+POST /v1/versions                                       <- gob(VersionSet) | json(VersionSet) -> Replicate state between leaders
+ PUT /v1/versions/{name}?[version={version}]            <- {data}                             -> Set latest version, unblocking watches
 `
 
 func main() {
@@ -443,13 +439,13 @@ func main() {
 	flag.StringVar(&config.ReplicateWith, "replicate-with", config.ReplicateWith, "Other writeable nodes as a comma separated list. Will resolve DNS and gossip state with all resolved ips. This should be their server-listen address!")
 	flag.DurationVar(&config.ReplicateEvery, "replicate-interval", config.ReplicateEvery, "How often to exchange state with peers")
 	flag.DurationVar(&config.ReplicateResolveEvery, "replicate-resolve-interval", config.ReplicateResolveEvery, "How often to resolve replicate-with to find peers")
-
+	flag.Uint64Var(&config.ReplicateLimitBytes, "replicate-limit-bytes", config.ReplicateLimitBytes, "When bulk replicating, limit responses to this size")
 	flag.StringVar(&config.FillFrom, "fill-from", config.FillFrom, "The address to fill from when a version is missing")
 	flag.StringVar(&config.FillPath, "fill-path", config.FillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
 	flag.DurationVar(&config.FillExpiry, "fill-expiry", config.FillExpiry, "Ask the upstream at least once every interval, for example 10s we would ask upstream every 10s")
 	flag.StringVar(&config.FillStrategy, "fill-strategy", config.FillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
 	flag.Uint64Var(&config.DataLimitBytes, "data-limit-bytes", config.DataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
-	flag.BoolVar(&config.DataLimitError, "data-limit-error", config.DataLimitError, "When data exceeds the limit, should an error occur.")
+	flag.BoolVar(&config.DataLimitError, "data-limit-error", config.DataLimitError, "When data exceeds the limit, should an error occur or just truncate")
 	flag.DurationVar(&config.BlockFor, "block-for", config.BlockFor, "The duration to block GETs by default for")
 	flag.DurationVar(&config.JitterPerWatch, "jitter-per-watch", config.JitterPerWatch, "The duration to jitter blocking GETs by proportional to the number of outstanding watches on this version")
 	flag.Parse()

@@ -154,7 +154,6 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 
 			var buf bytes.Buffer
 			versionSet := api.VersionSet{
-				Protocol: 0,
 				Versions: myVersions,
 			}
 

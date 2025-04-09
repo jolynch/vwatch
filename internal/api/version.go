@@ -8,7 +8,6 @@ import (
 )
 
 type VersionSet struct {
-	Protocol int       `json:"protocol"`
 	Versions []Version `json:"versions"`
 }
 
