@@ -20,37 +20,59 @@ var (
 	ValidFillStrategies = []string{conf.FillCache, conf.FillWatch}
 )
 
+type FillRequest struct {
+	NameParams map[string]string
+	URL        string
+	Header     http.Header
+}
+
 type Filler struct {
 	Addr     string
 	Path     string
 	FillBody bool
 	Client   *http.Client
 	Monitor  *sync.Map
-	Channel  chan map[string]string
+	Channel  chan FillRequest
 }
 
-func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (version api.Version, err error) {
+func (filler Filler) Fill(nameParams map[string]string, req *http.Request) (version api.Version, err error) {
 	if filler.Addr == "" {
 		err = errors.New("no upstream to fill from")
 		return
 	}
-	name := nameParams["name"]
+	var (
+		httpParams = req.URL.Query()
+		name       = nameParams["name"]
+		filledURL  string
+	)
+
 	urlPath, err := parse.ExpandPattern(filler.Path, nameParams)
 	if err != nil {
 		return
 	}
 	slog.Debug(fmt.Sprintf("Fill [%s] expanded url to: %s", name, urlPath))
 
-	filled, err := url.JoinPath(filler.Addr, urlPath)
+	fillerURL, err := url.JoinPath(filler.Addr, urlPath)
 	if err != nil {
 		slog.Warn(fmt.Sprintf("Fill [%s] url missing http:// in fill-addr: %s", name, err.Error()))
 		return
 	}
 	if len(httpParams) > 0 {
-		filled = fmt.Sprintf("%s?%s", filled, httpParams.Encode())
+		filledURL = fmt.Sprintf("%s?%s", fillerURL, httpParams.Encode())
+	} else {
+		filledURL = fillerURL
 	}
-	slog.Info(fmt.Sprintf("Fill [%s] GET %s", name, filled))
-	resp, err := filler.Client.Get(filled)
+	slog.Info(fmt.Sprintf("Fill [%s] GET %s", name, filledURL))
+
+	// Copy any headers
+	newReq, _ := http.NewRequest("GET", filledURL, nil)
+	for hdr, values := range req.Header {
+		for _, value := range values {
+			newReq.Header.Add(hdr, value)
+		}
+	}
+
+	resp, err := filler.Client.Do(newReq)
 	if err != nil {
 		slog.Warn(fmt.Sprintf("Fill [%s] GET call failed: %s", name, err.Error()))
 		return
@@ -86,7 +108,7 @@ func (filler Filler) Fill(nameParams map[string]string, httpParams url.Values) (
 	_, ok := filler.Monitor.LoadOrStore(name, nil)
 	if !ok {
 		slog.Info(fmt.Sprintf("Fill [%s] enqueueing monitor", name))
-		filler.Channel <- nameParams
+		filler.Channel <- FillRequest{NameParams: nameParams, URL: filledURL, Header: newReq.Header}
 	} else {
 		slog.Debug(fmt.Sprintf("Fill [%s] skipping monitor", name))
 	}
@@ -104,20 +126,25 @@ type update func(string, api.Version) api.Version
 func (filler Filler) Watch(state *sync.Map, fillExpiry time.Duration, newVersion update, fillStrategy string) {
 	slog.Info("Starting Filler Watch")
 	for {
-		params := <-filler.Channel
+		fillRequest := <-filler.Channel
+		params := fillRequest.NameParams
 		slog.Info(fmt.Sprintf("Spawning Watcher for: [%s]", params["name"]))
-		go watch(filler, params["name"], state, fillExpiry, newVersion, fillStrategy, params)
+		go watch(filler, params["name"], state, fillExpiry, newVersion, fillStrategy, fillRequest)
 	}
 }
 
-func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration, storeNewVersion update, fillStrategy string, nameParams map[string]string) {
+func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration, storeNewVersion update, fillStrategy string, fillRequest FillRequest) {
+	nameParams := fillRequest.NameParams
+
 	nextVersion := ""
 	for {
 		params := url.Values{}
 		params.Add("timeout", fillExpiry.String())
 		params.Add("version", nextVersion)
+		fillReq, _ := http.NewRequest("GET", fmt.Sprintf("%s?%s", fillRequest.URL, params.Encode()), nil)
+
 		pv, prevVersionExists := state.Load(name)
-		version, err := filler.Fill(nameParams, params)
+		version, err := filler.Fill(nameParams, fillReq)
 		if err != nil {
 			if prevVersionExists {
 				// Have observed a version in the past, need to keep watching in case it comes back

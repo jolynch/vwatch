@@ -235,7 +235,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			resp := make(chan api.Version, 1)
 			// Need to respect timeout when making fill calls
 			go func(response chan api.Version) {
-				version, err := filler.Fill(params, req.URL.Query())
+				version, err := filler.Fill(params, req)
 				if err == nil {
 					response <- version
 				}
@@ -525,7 +525,7 @@ func setupFill() {
 		Path:     config.FillPath,
 		Client:   client,
 		Monitor:  monitor,
-		Channel:  make(chan map[string]string, 2),
+		Channel:  make(chan repl.FillRequest, 2),
 		FillBody: config.FillStrategy == conf.FillWatch,
 	}
 	go filler.Watch(&versions, config.FillExpiry, storeNewVersion, config.FillStrategy)
