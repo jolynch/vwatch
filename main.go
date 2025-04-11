@@ -234,6 +234,8 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			params := parse.ParseName(name)
 			resp := make(chan api.Version, 1)
 			// Need to respect timeout when making fill calls
+			// Note that the fill client itself has a 10s timeout internally
+			// so we won't leak this channel, we just might hold onto it a little long
 			go func(response chan api.Version) {
 				version, err := filler.Fill(params, req)
 				if err == nil {
@@ -432,6 +434,7 @@ POST /v1/versions                                       <- gob(VersionSet) | jso
 
 func main() {
 	config = conf.FromEnv()
+	var fillHeaders headers.HeaderFlags
 
 	flag.StringVar(&config.ListenClient, "listen-client", config.ListenClient, "The address to listen on for clients")
 	flag.StringVar(&config.ListenServer, "listen-server", config.ListenServer, "The address to listen on for server traffic (replication)")
@@ -444,6 +447,7 @@ func main() {
 	flag.StringVar(&config.FillPath, "fill-path", config.FillPath, "The path on the fill host to fill from when a version is missing - can reference {name}, {repository} or {tag}")
 	flag.DurationVar(&config.FillExpiry, "fill-expiry", config.FillExpiry, "Ask the upstream at least once every interval, for example 10s we would ask upstream every 10s")
 	flag.StringVar(&config.FillStrategy, "fill-strategy", config.FillStrategy, "Either FILL_WATCH if vwatch upstream, or FILL_CACHE for an upstream that does not support watches")
+	flag.Var(&fillHeaders, "fill-headers", "One or more headers in the form 'Header: Value' that should be added during fills")
 	flag.Uint64Var(&config.DataLimitBytes, "data-limit-bytes", config.DataLimitBytes, "The number of bytes to store from PUTs. Note vwatch is _not_ a database, watch artifacts if you want more than this or store a path to the data")
 	flag.BoolVar(&config.DataLimitError, "data-limit-error", config.DataLimitError, "When data exceeds the limit, should an error occur or just truncate")
 	flag.DurationVar(&config.BlockFor, "block-for", config.BlockFor, "The duration to block GETs by default for")
@@ -454,6 +458,11 @@ func main() {
 	if !badStrategy {
 		slog.Error(fmt.Sprintf("Bad -fill-strategy, passed %s but only support %v", config.FillStrategy, repl.ValidFillStrategies))
 		os.Exit(2)
+	}
+	for key, values := range parse.ParseMatchingHeaders(fillHeaders, "") {
+		for _, value := range values {
+			config.FillHeaders.Add(key, value)
+		}
 	}
 
 	slog.Info("Configuration of Server:\n" + config.PrettyRepr())
@@ -521,12 +530,15 @@ func setupFill() {
 	}
 	monitor := &sync.Map{}
 	filler = &repl.Filler{
-		Addr:     config.FillFrom,
-		Path:     config.FillPath,
-		Client:   client,
-		Monitor:  monitor,
-		Channel:  make(chan repl.FillRequest, 2),
-		FillBody: config.FillStrategy == conf.FillWatch,
+		Addr:         config.FillFrom,
+		Path:         config.FillPath,
+		Client:       client,
+		Monitor:      monitor,
+		Channel:      make(chan repl.FillRequest, 2),
+		FillBody:     config.FillStrategy == conf.FillWatch,
+		FillExpiry:   config.FillExpiry,
+		FillStrategy: config.FillStrategy,
+		FillHeaders:  config.FillHeaders,
 	}
-	go filler.Watch(&versions, config.FillExpiry, storeNewVersion, config.FillStrategy)
+	go filler.Watch(&versions, storeNewVersion)
 }

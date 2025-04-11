@@ -23,19 +23,21 @@ var (
 type FillRequest struct {
 	NameParams map[string]string
 	URL        string
-	Header     http.Header
 }
 
 type Filler struct {
-	Addr     string
-	Path     string
-	FillBody bool
-	Client   *http.Client
-	Monitor  *sync.Map
-	Channel  chan FillRequest
+	Addr         string
+	Path         string
+	FillBody     bool
+	FillExpiry   time.Duration
+	FillStrategy string
+	FillHeaders  http.Header
+	Client       *http.Client
+	Monitor      *sync.Map
+	Channel      chan FillRequest
 }
 
-func (filler Filler) Fill(nameParams map[string]string, req *http.Request) (version api.Version, err error) {
+func (filler *Filler) Fill(nameParams map[string]string, req *http.Request) (version api.Version, err error) {
 	if filler.Addr == "" {
 		err = errors.New("no upstream to fill from")
 		return
@@ -64,9 +66,9 @@ func (filler Filler) Fill(nameParams map[string]string, req *http.Request) (vers
 	}
 	slog.Info(fmt.Sprintf("Fill [%s] GET %s", name, filledURL))
 
-	// Copy any headers
+	// Inject any headers we have been asked to
 	newReq, _ := http.NewRequest("GET", filledURL, nil)
-	for hdr, values := range req.Header {
+	for hdr, values := range filler.FillHeaders {
 		for _, value := range values {
 			newReq.Header.Add(hdr, value)
 		}
@@ -108,7 +110,7 @@ func (filler Filler) Fill(nameParams map[string]string, req *http.Request) (vers
 	_, ok := filler.Monitor.LoadOrStore(name, nil)
 	if !ok {
 		slog.Info(fmt.Sprintf("Fill [%s] enqueueing monitor", name))
-		filler.Channel <- FillRequest{NameParams: nameParams, URL: filledURL, Header: newReq.Header}
+		filler.Channel <- FillRequest{NameParams: nameParams, URL: fillerURL}
 	} else {
 		slog.Debug(fmt.Sprintf("Fill [%s] skipping monitor", name))
 	}
@@ -123,20 +125,21 @@ func (filler Filler) Fill(nameParams map[string]string, req *http.Request) (vers
 
 type update func(string, api.Version) api.Version
 
-func (filler Filler) Watch(state *sync.Map, fillExpiry time.Duration, newVersion update, fillStrategy string) {
+func (filler *Filler) Watch(state *sync.Map, newVersion update) {
 	slog.Info("Starting Filler Watch")
 	for {
 		fillRequest := <-filler.Channel
 		params := fillRequest.NameParams
 		slog.Info(fmt.Sprintf("Spawning Watcher for: [%s]", params["name"]))
-		go watch(filler, params["name"], state, fillExpiry, newVersion, fillStrategy, fillRequest)
+		go watch(filler, params["name"], state, newVersion, fillRequest)
 	}
 }
 
-func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration, storeNewVersion update, fillStrategy string, fillRequest FillRequest) {
+func watch(filler *Filler, name string, state *sync.Map, storeNewVersion update, fillRequest FillRequest) {
 	nameParams := fillRequest.NameParams
-
 	nextVersion := ""
+	fillExpiry := filler.FillExpiry
+
 	for {
 		params := url.Values{}
 		params.Add("timeout", fillExpiry.String())
@@ -148,8 +151,8 @@ func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration
 		if err != nil {
 			if prevVersionExists {
 				// Have observed a version in the past, need to keep watching in case it comes back
-				backoff := rand.Int63n(fillExpiry.Milliseconds())
-				slog.Warn(fmt.Sprintf("Failed while filling [%s], backing off %dms: %s", name, backoff, err.Error()))
+				backoff := fillExpiry.Milliseconds() + rand.Int63n(fillExpiry.Milliseconds())
+				slog.Warn(fmt.Sprintf("Failed while filling [%s], waiting %dms: %s", name, backoff, err.Error()))
 				time.Sleep(time.Duration(backoff) * time.Millisecond)
 			} else {
 				// Have never received a valid version, we cannot watch it yet, let another request attempt to get it
@@ -162,11 +165,15 @@ func watch(filler Filler, name string, state *sync.Map, fillExpiry time.Duration
 			if prevVersionExists {
 				prevTs := pv.(api.Version).LastSync.UnixNano()
 				if prevTs < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
-					slog.Info(fmt.Sprintf("Replacing state[%s] with newer version %s compared to %s", name, version, pv.(api.Version)))
+					slog.Info(
+						fmt.Sprintf(
+							"Replacing state[%s] with newer version %s compared to %s",
+							name, version.Format(32), pv.(api.Version).Format(32),
+						))
 					go storeNewVersion(name, version)
 				}
 			}
-			if fillStrategy == conf.FillCache {
+			if filler.FillStrategy == conf.FillCache {
 				time.Sleep(fillExpiry)
 			}
 		}

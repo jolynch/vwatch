@@ -4,11 +4,14 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net/http"
 	"os"
 	"reflect"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/jolynch/vwatch/internal/parse"
 )
 
 const (
@@ -28,6 +31,7 @@ type Config struct {
 	FillPath              string        `json:"fill-path"`
 	FillExpiry            time.Duration `json:"fill-expiry"`
 	FillStrategy          string        `json:"fill-strategy"`
+	FillHeaders           http.Header   `json:"fill-headers"`
 	BlockFor              time.Duration `json:"block-for"`
 	JitterPerWatch        time.Duration `json:"jitter-per-watch"`
 	LogLevel              slog.Level    `json:"log-level"`
@@ -64,6 +68,8 @@ func repr(val any) (result string) {
 		result = fmt.Sprintf("\"%s\"", v.String())
 	case bool:
 		result = fmt.Sprintf("%t", v)
+	case http.Header:
+		result = fmt.Sprintf("%v", v)
 	default:
 		result = fmt.Sprintf("\"%s\"", v)
 	}
@@ -83,6 +89,7 @@ func FromEnv() Config {
 		FillPath:              EnvString("VWATCH_FILL_PATH", "/v1/versions/{{.name}}"),
 		FillExpiry:            EnvDuration("VWATCH_FILL_EXPIRY", 10*time.Second),
 		FillStrategy:          EnvString("VWATCH_FILL_STRATEGY", FillWatch),
+		FillHeaders:           parse.ParseMatchingHeaders(os.Environ(), "VWATCH_FILL_HEADERS"),
 		BlockFor:              EnvDuration("VWATCH_BLOCK_FOR", 10*time.Second),
 		JitterPerWatch:        EnvDuration("VWATCH_JITTER_PER_WATCH", 1*time.Millisecond),
 		LogLevel:              EnvLogLevel("VWATCH_LOG_LEVEL", slog.LevelInfo),

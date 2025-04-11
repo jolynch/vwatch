@@ -1,9 +1,12 @@
 package parse
 
 import (
+	"bufio"
 	"bytes"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"net/textproto"
 	"strings"
 	"text/template"
 )
@@ -36,6 +39,43 @@ func ParseName(name string) map[string]string {
 		"repository": repository,
 		"tag":        tag,
 	}
+}
+
+func ParseMatchingHeaders(args []string, prefix string) http.Header {
+	headers := make(http.Header)
+	for _, env := range args {
+		components := strings.SplitN(env, "=", 2)
+		key := components[0]
+		if strings.HasPrefix(key, prefix) {
+			// Handles flag parsing where we have Key: Value
+			// OR Environment Variable parsing where we have Key=Value
+			var value string
+			switch len(components) {
+			case 1:
+				value = components[0]
+			case 2:
+				value = components[1]
+			default:
+				value = ""
+			}
+			if len(components) > 1 {
+				value = components[1]
+			}
+			parser := textproto.NewReader(bufio.NewReader(strings.NewReader(value)))
+			hdr, err := parser.ReadMIMEHeader()
+			if err != nil {
+				for k, vs := range hdr {
+					for _, v := range vs {
+						headers.Add(k, v)
+					}
+				}
+			} else {
+				slog.Warn(fmt.Sprintf("Skipping malformed header [%s] in env var %s: %s", value, key, err.Error()))
+			}
+
+		}
+	}
+	return headers
 }
 
 func ExpandPattern(pattern string, params map[string]string) (res string, err error) {

@@ -59,3 +59,40 @@ func TestExpandPath(t *testing.T) {
 	verify("/v2/{{.repository}}/manifests/{{.tag}}", "/v2/repo/image/manifests/tag", false)
 	verify("/v2/{{.na}}/manifests/{{.tag}}", "", true)
 }
+
+func TestParseMatchingHeadersArgs(t *testing.T) {
+	flags := []string{
+		"Accept: application/vnd.docker.distribution.manifest.v2+json",
+		"Accept: application/vnd.docker.distribution.manifest.list.v2+json",
+		"Content-Type: application/json",
+	}
+	hdrs := ParseMatchingHeaders(flags, "")
+	if len(hdrs.Values("Accept")) != 2 {
+		t.Errorf("Expected two Accept headers, found %d", len(hdrs.Values("Accept")))
+	}
+	if hdrs.Get("Content-Type") != "application/json" {
+		t.Errorf("Expected value to be parsed for Content-Type header")
+	}
+}
+
+func TestParseMatchingHeadersEnv(t *testing.T) {
+	env := []string{
+		"VWATCH_FILL_HEADERS_DOCKER=Accept: application/vnd.docker.distribution.manifest.v2+json",
+		"VWATCH_FILL_HEADERS_DOCKER_LIST=Accept: application/vnd.docker.distribution.manifest.list.v2+json",
+		"VWATCH_OTHER=Accept: bad",
+		"VWATCH_FILL_HEADERS_CONTENT=Content-Type: application/text",
+	}
+	hdrs := ParseMatchingHeaders(env, "VWATCH_FILL_HEADERS")
+	if len(hdrs.Values("Accept")) != 2 {
+		t.Errorf("Expected two Accept headers, found %d", len(hdrs.Values("Accept")))
+	}
+	if hdrs.Values("Accept")[0] != "application/vnd.docker.distribution.manifest.v2+json" {
+		t.Errorf("Expected value to be parsed for Accept header")
+	}
+	if len(hdrs) != 2 {
+		t.Errorf("Got extra headers")
+	}
+	if hdrs.Get("Content-Type") != "application/text" {
+		t.Errorf("Expected value to be parsed for Content-Type header")
+	}
+}
