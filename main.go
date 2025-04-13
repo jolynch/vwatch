@@ -164,10 +164,19 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	// Try to get Version from the version URL parameter
-	v, ok := req.URL.Query()["version"]
-	if ok && len(v[0]) > 0 {
-		version.Version = v[0]
+	// Version comes from one of three places
+	// 1. ETag header
+	// 2. "version" URL parameter
+	// 3. Falls back to the digest of the body
+	etag := req.Header.Get(headers.ETag)
+	if etag != "" {
+		// Take the version from the header if present
+		version.Version = parse.ParseETagToVersion(etag)
+	} else {
+		v, ok := req.URL.Query()["version"]
+		if ok && len(v[0]) > 0 {
+			version.Version = v[0]
+		}
 	}
 
 	// Data comes from the first DataLimitBytes of the request body
@@ -310,9 +319,11 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 
 	// ETag must be enclosed in double quotes
 	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
+	// It is _against the spec_ to include a more precise timestamp
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
-	w.Header().Set(headers.ContentType, headers.ContentTypeBytes)
+	w.Header().Set(headers.XLastSyncMicros, fmt.Sprintf("%d", version.LastSync.UnixMicro()))
 	w.Header().Add(headers.ServerTiming, strings.Join(timings, ", "))
+	w.Header().Set(headers.ContentType, headers.ContentTypeBytes)
 	w.WriteHeader(http.StatusOK)
 	w.Write(version.Data)
 }

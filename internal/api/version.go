@@ -7,8 +7,14 @@ import (
 	"unicode/utf8"
 )
 
+type Peer struct {
+	Peer   string
+	NodeId string
+}
+
 type VersionSet struct {
 	Versions []Version `json:"versions"`
+	Peers    []string  `json:"peers"`
 }
 
 type Version struct {

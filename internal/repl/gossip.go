@@ -84,6 +84,10 @@ type WriteResult struct {
 	Failed     []string
 }
 
+// Best effort write to peers. Note that we send to everyone async and
+// wait for either success or failure with a 1s deadline attached to each
+// write to guarantee progress. This method may block for up to that timeout
+// and does not guarantee that all nodes have received the new version.
 func (gossiper *Gossiper) Write(version api.Version) (result WriteResult, err error) {
 	if version.Name == "" || version.Version == "" {
 		return
@@ -95,7 +99,13 @@ func (gossiper *Gossiper) Write(version api.Version) (result WriteResult, err er
 	_ = copy(peersCopy, gossiper.Peers)
 	gossiper.PeerMutex.RUnlock()
 
-	var req *http.Request
+	var (
+		req     *http.Request
+		wg      sync.WaitGroup
+		success chan string = make(chan string, len(peersCopy))
+		failed  chan string = make(chan string, len(peersCopy))
+	)
+
 	for _, peer := range peersCopy {
 		uri := peer + "/" + url.PathEscape(version.Name)
 		if version.Version != "" {
@@ -105,32 +115,53 @@ func (gossiper *Gossiper) Write(version api.Version) (result WriteResult, err er
 			params.Add("source", gossiper.Config.NodeId)
 			uri = fmt.Sprintf("%s?%s", uri, params.Encode())
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
-		defer cancel()
 
-		req, err = http.NewRequestWithContext(ctx, http.MethodPut, uri, bytes.NewBuffer(version.Data))
-		req.Header.Set(headers.ContentType, headers.ContentTypeBytes)
-		if err != nil {
-			return
-		}
+		wg.Add(1)
+		go func(peer string, uri string, version api.Version, success chan string, failure chan string) {
+			defer wg.Done()
+			ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+			defer cancel()
 
-		_, err = gossiper.Client.Do(req)
-		if err == nil {
-			result.Successful = append(result.Successful, peer)
-		} else {
-			result.Failed = append(result.Failed, peer)
+			req, err = http.NewRequestWithContext(ctx, http.MethodPut, uri, bytes.NewBuffer(version.Data))
+			if err != nil {
+				failure <- peer
+				return
+			}
+			req.Header.Set(headers.ContentType, headers.ContentTypeBytes)
+
+			_, err = gossiper.Client.Do(req)
+			if err == nil {
+				success <- peer
+			} else {
+				failure <- peer
+			}
+		}(peer, uri, version, success, failed)
+	}
+	wg.Wait()
+	// Since all results are back we can close
+	for _, _ = range peersCopy {
+		select {
+		case s := <-success:
+			result.Successful = append(result.Successful, s)
+		case f := <-failed:
+			result.Failed = append(result.Failed, f)
 		}
 	}
+	close(success)
+	close(failed)
+
 	delta := time.Since(start)
 	if len(peersCopy) > 0 {
 		slog.Info(fmt.Sprintf("Sent [%s] to %d/%d peers after %s", version.Format(0), len(result.Successful), len(peersCopy), delta))
 		if len(result.Failed) > 0 {
-			slog.Warn("Failed to replicate [%s] to: %v", version.Name, peersCopy)
+			slog.Warn(fmt.Sprintf("Failed to replicate [%s] to: %v", version.Name, result.Failed))
 		}
 	}
 	return result, err
 }
 
+// Periodic version set exchange between peers. Runs in a loop, constantly sending
+// our hash tree and asking for any deltas.
 func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time.Duration) {
 	for {
 		gossiper.PeerMutex.RLock()
@@ -138,7 +169,7 @@ func (gossiper *Gossiper) Replicate(upsertVersion update, replicateInterval time
 		_ = copy(peersCopy, gossiper.Peers)
 		gossiper.PeerMutex.RUnlock()
 
-		// So we exchange state with random nodes, bringing convergence down to worst case 1s * numPeers
+		// So we exchange state with random nodes, bounding convergence to worst case 1s * numPeers
 		rand.Shuffle(len(peersCopy), func(i, j int) { peersCopy[i], peersCopy[j] = peersCopy[j], peersCopy[i] })
 		for _, peer := range peersCopy {
 			slog.Debug("Gossip with [" + peer + "]")
