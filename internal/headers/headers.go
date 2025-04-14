@@ -5,7 +5,7 @@ import "fmt"
 const (
 	ETag             = "ETag"
 	LastModified     = "Last-Modified"
-	XLastSyncMicros  = "X-Last-Sync-Micros"
+	XLastSync        = "X-Last-Sync"
 	ContentType      = "Content-Type"
 	ContentTypeJson  = "application/json"
 	ContentTypeBytes = "application/octet-stream"

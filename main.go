@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -38,18 +39,20 @@ var (
 type Watcher struct {
 	Signal       chan string
 	NumConsumers *atomic.Int64
+	LastSync     time.Time
 }
 
-func makeWatcher() Watcher {
+func makeWatcher(lastSync time.Time) Watcher {
 	var consumer atomic.Int64
 	return Watcher{
 		Signal:       make(chan string),
 		NumConsumers: &consumer,
+		LastSync:     lastSync,
 	}
 }
 
-func loadOrStoreWatcher(name, version string) Watcher {
-	v, _ := loadOrStoreWatcherMap(name).LoadOrStore(version, makeWatcher())
+func loadOrStoreWatcher(name, version string, lastSync time.Time) Watcher {
+	v, _ := loadOrStoreWatcherMap(name).LoadOrStore(version, makeWatcher(lastSync))
 	return v.(Watcher)
 }
 
@@ -84,8 +87,8 @@ func storeNewVersion(name string, version api.Version) (result api.Version) {
 	// }
 
 	if hasVersion {
-		prev := pv.(api.Version).LastSync.UnixNano()
-		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+		prev := pv.(api.Version).LastSync.UnixMicro()
+		if prev < version.LastSync.UnixMicro() && pv.(api.Version).Version != version.Version {
 			versions.Store(name, version)
 		} else {
 			version = pv.(api.Version)
@@ -101,12 +104,17 @@ func storeNewVersion(name string, version api.Version) (result api.Version) {
 	if hasWatch {
 		watchMap := pw.(*sync.Map)
 		latestVersion := version.Version
+		latestSync := version.LastSync
 		// Wake any reads waiting on versions other than this latest version
 		watchMap.Range(func(key, value any) bool {
 			if latestVersion != key.(string) {
 				watcher := value.(Watcher)
-				close(watcher.Signal)
-				watchMap.Delete(key)
+				// Newer versions may be watched, in which case we will
+				// eventually observe that new version and wake them
+				if watcher.LastSync.Compare(latestSync) < 0 {
+					close(watcher.Signal)
+					watchMap.Delete(key)
+				}
 			}
 			return true
 		})
@@ -142,7 +150,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 
 	// Last Modified comes from one of three places
 	// 1. Last-Modified header in RFC1123 GMT encoding
-	// 2. "modified" URL paremeter in RFC3339 encoding
+	// 2. "modified" URL parameter with the unix time in microseconds
 	// 3. Falls back to the current server time
 	m := req.Header.Get(headers.LastModified)
 	if m != "" {
@@ -154,11 +162,12 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	} else {
 		v, ok := req.URL.Query()["modified"]
 		if ok && len(v[0]) >= 0 {
-			version.LastSync, err = time.Parse(time.RFC3339, v[0])
+			micros, err := strconv.ParseInt(v[0], 10, 64)
 			if err != nil {
-				http.Error(w, "Invalid RFC3339 modified url parameter provided: "+err.Error(), http.StatusBadRequest)
+				http.Error(w, "Invalid modified url parameter provided: "+err.Error(), http.StatusBadRequest)
 				return
 			}
+			version.LastSync = time.UnixMicro(micros)
 		} else {
 			version.LastSync = time.Now()
 		}
@@ -202,6 +211,7 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 	// ETag must be enclosed in double quotes
 	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", latestVersion.Version))
 	w.Header().Set(headers.LastModified, latestVersion.LastSync.UTC().Format(http.TimeFormat))
+	w.Header().Set(headers.XLastSync, fmt.Sprintf("%d", latestVersion.LastSync.UnixMicro()))
 
 	if latestVersion.Version == version.Version {
 		w.WriteHeader(http.StatusNoContent)
@@ -216,12 +226,13 @@ func putVersion(w http.ResponseWriter, req *http.Request) {
 
 func getVersion(w http.ResponseWriter, req *http.Request) {
 	var (
-		timeout time.Duration = config.BlockFor
-		err     error
-		version api.Version
-		name    string    = req.PathValue("name")
-		start   time.Time = time.Now()
-		timings []string
+		timeout  time.Duration = config.BlockFor
+		err      error
+		version  api.Version
+		lastSync int64     = 0
+		name     string    = req.PathValue("name")
+		start    time.Time = time.Now()
+		timings  []string
 	)
 
 	t, ok := req.URL.Query()["timeout"]
@@ -246,7 +257,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			// Note that the fill client itself has a 10s timeout internally
 			// so we won't leak this channel, we just might hold onto it a little long
 			go func(response chan api.Version) {
-				version, err := filler.Fill(params, req)
+				version, _, err := filler.Fill(params, req)
 				if err == nil {
 					response <- version
 				}
@@ -284,9 +295,23 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 
 		}
 	}
-	if previousVersion != "" && previousVersion == version.Version {
+	// It's possible a watcher may have observed a newer version than
+	// this node, in which case we should watch our own version
+	prevSync, watchVersion := req.Header.Get(headers.XLastSync), previousVersion
+	if prevSync != "" {
+		lastSync, err = strconv.ParseInt(prevSync, 10, 64)
+		if err != nil {
+			http.Error(w, "Invalid x-last-sync header: "+err.Error(), http.StatusBadRequest)
+			return
+		}
+		if lastSync > version.LastSync.UnixMicro() {
+			watchVersion = version.Version
+		}
+	}
+
+	if previousVersion != "" && watchVersion == version.Version {
 		// Long poll on this version
-		watcher := loadOrStoreWatcher(name, version.Version)
+		watcher := loadOrStoreWatcher(name, watchVersion, version.LastSync)
 		watcher.NumConsumers.Add(1)
 
 		select {
@@ -303,6 +328,12 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 			return
 		}
 		version = val.(api.Version)
+		if lastSync > version.LastSync.UnixMicro() {
+			msg := fmt.Sprintf(
+				"Would return stale version even after waiting for replication: %s > %s",
+				time.UnixMicro(lastSync).UTC(), version.LastSync.UTC())
+			http.Error(w, msg, http.StatusConflict)
+		}
 		if config.JitterPerWatch.Milliseconds() > 0 {
 			jitterTarget := numWatchers * config.JitterPerWatch.Milliseconds()
 			jitterDuration := min(config.BlockFor, time.Duration(rand.Int63n(jitterTarget))*time.Millisecond)
@@ -321,7 +352,8 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 	w.Header().Set(headers.ETag, fmt.Sprintf("\"%s\"", version.Version))
 	// It is _against the spec_ to include a more precise timestamp
 	w.Header().Set(headers.LastModified, version.LastSync.UTC().Format(http.TimeFormat))
-	w.Header().Set(headers.XLastSyncMicros, fmt.Sprintf("%d", version.LastSync.UnixMicro()))
+	// So we need a second header with microsecond precision
+	w.Header().Set(headers.XLastSync, fmt.Sprintf("%d", version.LastSync.UnixMicro()))
 	w.Header().Add(headers.ServerTiming, strings.Join(timings, ", "))
 	w.Header().Set(headers.ContentType, headers.ContentTypeBytes)
 	w.WriteHeader(http.StatusOK)
@@ -331,8 +363,8 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 func upsertVersion(name string, version api.Version) api.Version {
 	pv, ok := versions.Load(name)
 	if ok {
-		prev := pv.(api.Version).LastSync.UnixNano()
-		if prev < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+		prev := pv.(api.Version).LastSync.UnixMicro()
+		if prev < version.LastSync.UnixMicro() && pv.(api.Version).Version != version.Version {
 			return storeNewVersion(name, version)
 		}
 		return pv.(api.Version)

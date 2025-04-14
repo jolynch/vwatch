@@ -111,7 +111,7 @@ func (gossiper *Gossiper) Write(version api.Version) (result WriteResult, err er
 		if version.Version != "" {
 			params := url.Values{}
 			params.Add("version", version.Version)
-			params.Add("modified", version.LastSync.Format(time.RFC3339))
+			params.Add("modified", fmt.Sprintf("%d", version.LastSync.UnixMicro()))
 			params.Add("source", gossiper.Config.NodeId)
 			uri = fmt.Sprintf("%s?%s", uri, params.Encode())
 		}

@@ -112,7 +112,7 @@ New versions may specify their `version` via:
 
 New versions may specify their `last-sync` timestamp via:
 1. `Last-Modified` header in RFC1123 GMT encoding
-2. `modified` URL parameter in RFC3339 encoding
+2. `modified` URL parameter in microsecond unix time encoding
 3. Let the server calculate the timestamp with current server time
 
 The body conveys the `Data` of the version, which for `FILL_CACHE` Leaders
@@ -126,7 +126,7 @@ PUT /v1/versions/{name}
 
 Now updating that with a user provided timestamp
 ```
-PUT /v1/versions/{name}?modified=2025-04-12T18:29:05-04:00
+PUT /v1/versions/{name}?modified=1744597819741553
 345
 ```
 Now update with a user provided version and timestamp:
