@@ -189,8 +189,8 @@ func watch(filler *Filler, name string, state *sync.Map, storeNewVersion update,
 		} else {
 			nextVersion = version.Version
 			if prevVersionExists {
-				prevTs := pv.(api.Version).LastSync.UnixNano()
-				if prevTs < version.LastSync.UnixNano() && pv.(api.Version).Version != version.Version {
+				prevTs := pv.(api.Version).LastSync.UnixMicro()
+				if prevTs < version.LastSync.UnixMicro() && pv.(api.Version).Version != version.Version {
 					slog.Info(
 						fmt.Sprintf(
 							"Replacing state[%s] with newer version %s compared to %s",

@@ -417,8 +417,8 @@ func replicate(w http.ResponseWriter, req *http.Request) {
 		pv, ok := versions.Load(version.Name)
 		if ok {
 			prevVersion := pv.(api.Version)
-			prev := prevVersion.LastSync.UnixNano()
-			if prev > version.LastSync.UnixNano() && prevVersion.Version != version.Version {
+			prev := prevVersion.LastSync.UnixMicro()
+			if prev > version.LastSync.UnixMicro() && prevVersion.Version != version.Version {
 				deltas = append(deltas, prevVersion)
 				budgetBytes -= prevVersion.SizeBytes()
 			}
