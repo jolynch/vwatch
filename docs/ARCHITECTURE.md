@@ -165,7 +165,7 @@ state (minus replication delay).
 This layered approach makes `vwatch` easy to scale and integrate into any
 application framework.
 
-# Usefullness of this Architecture
+# Usefulness of this Architecture
 While `vwatch` is not a database, it can be used to layer `Zookeeper`, `Etcd`
 or `Consul` style watches on _other_ databases, which makes it quite useful.
 
