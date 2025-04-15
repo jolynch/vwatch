@@ -333,6 +333,7 @@ func getVersion(w http.ResponseWriter, req *http.Request) {
 				"Would return stale version even after waiting for replication: %s > %s",
 				time.UnixMicro(lastSync).UTC(), version.LastSync.UTC())
 			http.Error(w, msg, http.StatusConflict)
+			return
 		}
 		if config.JitterPerWatch.Milliseconds() > 0 {
 			jitterTarget := numWatchers * config.JitterPerWatch.Milliseconds()
